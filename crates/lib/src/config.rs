@@ -32,6 +32,8 @@ pub struct Config {
     pub validation: ValidationConfig,
     pub kora: KoraConfig,
     #[serde(default)]
+    pub path8: Path8Config,
+    #[serde(default)]
     pub metrics: MetricsConfig,
 }
 
@@ -431,6 +433,8 @@ pub struct EnabledMethods {
     pub estimate_transaction_fee: bool,
     pub get_supported_tokens: bool,
     pub get_payer_signer: bool,
+    /// Path8 governed execution entrypoint.
+    pub path8_execute: bool,
     pub sign_transaction: bool,
     pub sign_and_send_transaction: bool,
     pub transfer_transaction: bool,
@@ -450,6 +454,7 @@ impl EnabledMethods {
             self.estimate_transaction_fee,
             self.get_supported_tokens,
             self.get_payer_signer,
+            self.path8_execute,
             self.sign_transaction,
             self.sign_and_send_transaction,
             self.transfer_transaction,
@@ -481,6 +486,9 @@ impl EnabledMethods {
         if self.get_payer_signer {
             methods.push("getPayerSigner".to_string());
         }
+        if self.path8_execute {
+            methods.push("path8_execute".to_string());
+        }
         if self.sign_transaction {
             methods.push("signTransaction".to_string());
         }
@@ -511,7 +519,7 @@ impl EnabledMethods {
 
 impl IntoIterator for &EnabledMethods {
     type Item = bool;
-    type IntoIter = std::array::IntoIter<bool, 13>;
+    type IntoIter = std::array::IntoIter<bool, 14>;
 
     fn into_iter(self) -> Self::IntoIter {
         [
@@ -519,6 +527,7 @@ impl IntoIterator for &EnabledMethods {
             self.estimate_transaction_fee,
             self.get_supported_tokens,
             self.get_payer_signer,
+            self.path8_execute,
             self.sign_transaction,
             self.sign_and_send_transaction,
             self.transfer_transaction,
@@ -540,6 +549,7 @@ impl Default for EnabledMethods {
             estimate_transaction_fee: true,
             get_supported_tokens: true,
             get_payer_signer: true,
+            path8_execute: false,
             sign_transaction: true,
             sign_and_send_transaction: true,
             transfer_transaction: true,
@@ -597,6 +607,44 @@ pub enum TransactionPluginType {
 pub struct PluginsConfig {
     /// List of enabled transaction plugins, executed for sign/signAndSend flows
     pub enabled: Vec<TransactionPluginType>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct Path8Config {
+    /// Enables Path8 approval-token enforcement for relayer-governed methods.
+    pub enabled: bool,
+    /// Environment variable containing the HS256 approval-token secret.
+    pub hmac_secret_env: String,
+    /// JSON-RPC method names that must carry a valid approval token.
+    pub required_for_methods: Vec<String>,
+    /// Redis URL used for one-shot JTI consumption. If unset while enabled,
+    /// protected methods deny by default.
+    pub redis_url: Option<String>,
+    /// Redis key prefix for consumed approval token JTIs.
+    pub jti_key_prefix: String,
+}
+
+impl Default for Path8Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hmac_secret_env: "PATH8_APPROVAL_HMAC_SECRET".to_string(),
+            required_for_methods: vec![
+                "path8_execute".to_string(),
+                "signTransaction".to_string(),
+                "signAndSendTransaction".to_string(),
+            ],
+            redis_url: None,
+            jti_key_prefix: "jti".to_string(),
+        }
+    }
+}
+
+impl Path8Config {
+    pub fn requires_method(&self, method: &str) -> bool {
+        self.enabled && self.required_for_methods.iter().any(|m| m == method)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, ToSchema)]

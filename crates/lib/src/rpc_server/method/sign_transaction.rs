@@ -1,4 +1,5 @@
 use crate::{
+    path8::enforce_path8_approval,
     rpc_server::middleware_utils::default_sig_verify,
     transaction::{TransactionUtil, VersionedTransactionOps, VersionedTransactionResolved},
     usage_limit::UsageTracker,
@@ -37,6 +38,10 @@ pub struct SignTransactionRequest {
     /// Optional user ID for usage tracking (required when pricing is Free and usage tracking is enabled)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
+    /// Path8 one-shot approval JWT. Required when `[path8].enabled = true`
+    /// and signTransaction is listed under `[path8].required_for_methods`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_token: Option<String>,
 }
 
 /// Response payload containing the signed transaction.
@@ -65,6 +70,14 @@ pub async fn sign_transaction(
         config,
         rpc_client,
         sig_verify,
+    )
+    .await?;
+
+    enforce_path8_approval(
+        config,
+        "signTransaction",
+        request.approval_token.as_deref(),
+        &resolved_transaction,
     )
     .await?;
 
@@ -134,6 +147,7 @@ mod tests {
             signer_key: None,
             sig_verify: true,
             user_id: None,
+            approval_token: None,
         };
 
         let result = sign_transaction(&rpc_client, request).await;
@@ -155,6 +169,7 @@ mod tests {
             signer_key: Some("invalid_pubkey".to_string()),
             sig_verify: true,
             user_id: None,
+            approval_token: None,
         };
 
         let result = sign_transaction(&rpc_client, request).await;
@@ -180,6 +195,7 @@ mod tests {
             signer_key: Some(target_pubkey.clone()),
             sig_verify: true,
             user_id: None,
+            approval_token: None,
         };
 
         let result = sign_transaction(&rpc_client, request).await;

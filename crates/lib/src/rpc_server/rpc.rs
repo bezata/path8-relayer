@@ -22,6 +22,7 @@ use crate::rpc_server::method::{
     get_payer_signer::{get_payer_signer, GetPayerSignerResponse},
     get_supported_tokens::{get_supported_tokens, GetSupportedTokensResponse},
     get_version::{get_version, GetVersionResponse},
+    path8_execute::{path8_execute, Path8ExecuteRequest, Path8ExecuteResponse},
     sign_and_send_bundle::{
         sign_and_send_bundle, SignAndSendBundleRequest, SignAndSendBundleResponse,
     },
@@ -103,6 +104,16 @@ impl KoraRpc {
         info!("Sign transaction request: {request:?}");
         let result = sign_transaction(&self.rpc_client, request).await;
         info!("Sign transaction response: {result:?}");
+        result
+    }
+
+    pub async fn path8_execute(
+        &self,
+        request: Path8ExecuteRequest,
+    ) -> Result<Path8ExecuteResponse, KoraError> {
+        info!("Path8 execute request: {request:?}");
+        let result = path8_execute(&self.rpc_client, request).await;
+        info!("Path8 execute response: {result:?}");
         result
     }
 
@@ -201,6 +212,11 @@ impl KoraRpc {
                 name: "getPayerSigner".to_string(),
                 request: None,
                 response: GetPayerSignerResponse::schema().1,
+            },
+            OpenApiSpec {
+                name: "path8_execute".to_string(),
+                request: Some(Path8ExecuteRequest::schema().1),
+                response: Path8ExecuteResponse::schema().1,
             },
             OpenApiSpec {
                 name: "signTransaction".to_string(),
