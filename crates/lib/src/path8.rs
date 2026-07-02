@@ -348,4 +348,28 @@ mod tests {
             compute_canonical_instruction_hash(&resolved2).unwrap()
         );
     }
+
+    #[test]
+    fn canonical_hash_matches_cross_repo_fixture() {
+        let payer = Pubkey::new_from_array([1; 32]);
+        let readonly_account = Pubkey::new_from_array([2; 32]);
+        let signer_writable_account = Pubkey::new_from_array([3; 32]);
+        let program = Pubkey::new_from_array([9; 32]);
+        let ix = Instruction::new_with_bytes(
+            program,
+            &[1, 2, 3, 4, 255],
+            vec![
+                AccountMeta::new_readonly(readonly_account, false),
+                AccountMeta::new(signer_writable_account, true),
+            ],
+        );
+        let message = VersionedMessage::Legacy(Message::new(&[ix], Some(&payer)));
+        let tx = crate::transaction::TransactionUtil::new_unsigned_versioned_transaction(message);
+        let resolved = VersionedTransactionResolved::from_kora_built_transaction(&tx).unwrap();
+
+        assert_eq!(
+            compute_canonical_instruction_hash(&resolved).unwrap(),
+            "42d0d2fcab6a47320cef69f4c4ad45a856874580b0e5c2a3654141f4adfc3f34"
+        );
+    }
 }
