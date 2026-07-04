@@ -962,6 +962,7 @@ mod tests {
                 require_one_of_programs: vec![],
             },
             kora: KoraConfig::default(),
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -1007,6 +1008,7 @@ mod tests {
                 require_one_of_programs: vec![],
             },
             kora: KoraConfig::default(),
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -1054,6 +1056,7 @@ mod tests {
                 require_one_of_programs: vec![],
             },
             kora: KoraConfig::default(),
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -1101,6 +1104,7 @@ mod tests {
                 require_one_of_programs: vec![],
             },
             kora: KoraConfig::default(),
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -1143,6 +1147,7 @@ mod tests {
                     liveness: false,
                     estimate_transaction_fee: false,
                     get_supported_tokens: false,
+                    path8_execute: false,
                     sign_transaction: false,
                     sign_and_send_transaction: false,
                     transfer_transaction: false,
@@ -1165,6 +1170,7 @@ mod tests {
                 sign_timeout_seconds: 10,
                 sign_max_retries: 2,
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -1305,6 +1311,7 @@ mod tests {
                 require_one_of_programs: vec![],
             },
             kora: KoraConfig::default(),
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -1344,6 +1351,7 @@ mod tests {
                 require_one_of_programs: vec![],
             },
             kora: KoraConfig::default(),
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -1380,6 +1388,7 @@ mod tests {
                 require_one_of_programs: vec![],
             },
             kora: KoraConfig::default(),
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -1495,6 +1504,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -1542,6 +1552,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -1586,6 +1597,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -1639,6 +1651,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -1677,6 +1690,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -1720,6 +1734,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -1761,6 +1776,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -1795,6 +1811,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         }
@@ -1818,6 +1835,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         }
@@ -1884,6 +1902,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -1919,6 +1938,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -1954,6 +1974,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -1995,6 +2016,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -2032,6 +2054,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -2073,6 +2096,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -2259,6 +2283,7 @@ mod tests {
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
             kora: KoraConfig::default(),
         };
@@ -2578,6 +2603,7 @@ mod tests {
                 require_one_of_programs: vec![],
             },
             kora: KoraConfig::default(),
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -2618,6 +2644,7 @@ mod tests {
                 require_one_of_programs: vec![],
             },
             kora: KoraConfig::default(),
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -2659,6 +2686,7 @@ mod tests {
                 require_one_of_programs: vec![],
             },
             kora: KoraConfig::default(),
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -2705,6 +2733,7 @@ mod tests {
                 },
                 ..Default::default()
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -2753,6 +2782,7 @@ mod tests {
                 },
                 ..Default::default()
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -2801,6 +2831,7 @@ mod tests {
                 },
                 ..Default::default()
             },
+            path8: Default::default(),
             metrics: MetricsConfig::default(),
         };
 

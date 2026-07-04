@@ -20,36 +20,35 @@ use crate::state::select_request_signer_with_signer_key;
 use crate::tests::config_mock::mock_state::get_config;
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct SignAndSendTransactionRequest {
+pub struct Path8ExecuteRequest {
+    /// Base64-encoded Solana transaction signed by the user/delegated authority.
     pub transaction: String,
-    /// Optional signer signer_key to ensure consistency across related RPC calls
+    /// One-shot approval JWT minted by Path8 for the transaction's canonical content hash.
+    pub approval_token: String,
+    /// Optional signer signer_key to ensure consistency across related RPC calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer_key: Option<String>,
-    /// Whether to verify signatures during simulation (defaults to false)
+    /// Whether to verify signatures during simulation (defaults to false).
     #[serde(default = "default_sig_verify")]
     pub sig_verify: bool,
-    /// Optional user ID for usage tracking (required when pricing is free and usage tracking is enabled)
+    /// Optional user ID for usage tracking (required when pricing is free and usage tracking is enabled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
-    /// Path8 one-shot approval JWT. Required when `[path8].enabled = true`
-    /// and signAndSendTransaction is listed under `[path8].required_for_methods`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_token: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct SignAndSendTransactionResponse {
+pub struct Path8ExecuteResponse {
     pub signed_transaction: String,
-    /// Public key of the signer used (for client consistency)
+    /// Public key of the relayer signer used for co-signing/paymaster.
     pub signer_pubkey: String,
-    /// Transaction signature
+    /// Transaction signature.
     pub signature: String,
 }
 
-pub async fn sign_and_send_transaction(
+pub async fn path8_execute(
     rpc_client: &Arc<RpcClient>,
-    request: SignAndSendTransactionRequest,
-) -> Result<SignAndSendTransactionResponse, KoraError> {
+    request: Path8ExecuteRequest,
+) -> Result<Path8ExecuteResponse, KoraError> {
     let transaction = TransactionUtil::decode_b64_transaction(&request.transaction)?;
 
     let config = &get_config()?;
@@ -68,13 +67,12 @@ pub async fn sign_and_send_transaction(
 
     enforce_path8_approval(
         config,
-        "signAndSendTransaction",
-        request.approval_token.as_deref(),
+        "path8_execute",
+        Some(request.approval_token.as_str()),
         &resolved_transaction,
     )
     .await?;
 
-    // Check usage limit for transaction sender
     UsageTracker::check_transaction_usage_limit(
         config,
         &mut resolved_transaction,
@@ -87,7 +85,7 @@ pub async fn sign_and_send_transaction(
     let (signature, signed_transaction) =
         resolved_transaction.sign_and_send_transaction(config, &signer, rpc_client).await?;
 
-    Ok(SignAndSendTransactionResponse {
+    Ok(Path8ExecuteResponse {
         signed_transaction,
         signer_pubkey: signer.pubkey().to_string(),
         signature,
@@ -100,52 +98,24 @@ mod tests {
     use crate::tests::{
         common::{setup_or_get_test_signer, setup_or_get_test_usage_limiter, RpcMockBuilder},
         config_mock::ConfigMockBuilder,
-        transaction_mock::create_mock_encoded_transaction,
     };
 
     #[tokio::test]
-    async fn test_sign_and_send_transaction_decode_error() {
+    async fn test_path8_execute_decode_error() {
         let _m = ConfigMockBuilder::new().build_and_setup();
         let _ = setup_or_get_test_signer();
-
         let _ = setup_or_get_test_usage_limiter().await;
-
         let rpc_client = Arc::new(RpcMockBuilder::new().build());
 
-        let request = SignAndSendTransactionRequest {
+        let request = Path8ExecuteRequest {
             transaction: "invalid_base64!@#$".to_string(),
+            approval_token: "token".to_string(),
             signer_key: None,
             sig_verify: true,
             user_id: None,
-            approval_token: None,
         };
 
-        let result = sign_and_send_transaction(&rpc_client, request).await;
-
+        let result = path8_execute(&rpc_client, request).await;
         assert!(result.is_err(), "Should fail with decode error");
-    }
-
-    #[tokio::test]
-    async fn test_sign_and_send_transaction_invalid_signer_key() {
-        let _m = ConfigMockBuilder::new().build_and_setup();
-        let _ = setup_or_get_test_signer();
-
-        let _ = setup_or_get_test_usage_limiter().await;
-
-        let rpc_client = Arc::new(RpcMockBuilder::new().build());
-
-        let request = SignAndSendTransactionRequest {
-            transaction: create_mock_encoded_transaction(),
-            signer_key: Some("invalid_pubkey".to_string()),
-            sig_verify: true,
-            user_id: None,
-            approval_token: None,
-        };
-
-        let result = sign_and_send_transaction(&rpc_client, request).await;
-
-        assert!(result.is_err(), "Should fail with invalid signer key");
-        let error = result.unwrap_err();
-        assert!(matches!(error, KoraError::ValidationError(_)), "Should return ValidationError");
     }
 }

@@ -124,6 +124,7 @@ impl ConfigMockBuilder {
                     sign_timeout_seconds: 10,
                     sign_max_retries: 2,
                 },
+                path8: Default::default(),
                 metrics: MetricsConfig::default(),
             },
         }

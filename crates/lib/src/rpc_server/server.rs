@@ -193,6 +193,14 @@ fn build_rpc_module(rpc: KoraRpc) -> Result<RpcModule<KoraRpc>, anyhow::Error> {
     register_method_if_enabled!(
         module,
         enabled_methods,
+        path8_execute,
+        "path8_execute",
+        path8_execute,
+        with_params
+    );
+    register_method_if_enabled!(
+        module,
+        enabled_methods,
         sign_transaction,
         "signTransaction",
         sign_transaction,
@@ -322,6 +330,7 @@ mod tests {
             estimate_transaction_fee: false,
             get_supported_tokens: false,
             get_payer_signer: false,
+            path8_execute: false,
             sign_transaction: false,
             sign_and_send_transaction: false,
             transfer_transaction: false,
@@ -358,6 +367,7 @@ mod tests {
             get_supported_tokens: true,
             estimate_transaction_fee: false,
             get_payer_signer: false,
+            path8_execute: false,
             sign_transaction: false,
             sign_and_send_transaction: false,
             transfer_transaction: false,
