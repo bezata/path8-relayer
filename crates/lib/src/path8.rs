@@ -31,14 +31,45 @@ struct JwtHeader {
     typ: Option<String>,
 }
 
-pub async fn enforce_path8_approval(
+/// Two-phase guard for a Path8 approval token.
+///
+/// Verifying the token (signature, expiry, content-hash binding) is reversible;
+/// consuming its single-use JTI is not. Splitting the two lets the caller run
+/// cheap pre-flight rejections (e.g. usage limits) *before* the irreversible
+/// burn, so a retryable failure no longer voids an otherwise-valid approval.
+/// The burn still happens strictly before the transaction is signed/sent, so
+/// the anti-replay / TOCTOU guarantee is preserved.
+#[derive(Debug)]
+#[must_use = "the approval JTI is only consumed when `.consume()` is awaited"]
+pub enum Path8ApprovalGuard {
+    /// Method is not Path8-gated (or enforcement is disabled) — nothing to burn.
+    NotRequired,
+    /// Token verified and bound to this transaction; JTI not yet consumed.
+    Pending { jti: String, exp: i64 },
+}
+
+impl Path8ApprovalGuard {
+    /// Burn the single-use JTI. Call immediately before the irreversible step
+    /// (network send, or handing a signed transaction back to the caller).
+    pub async fn consume(self, config: &Config) -> Result<(), KoraError> {
+        match self {
+            Path8ApprovalGuard::NotRequired => Ok(()),
+            Path8ApprovalGuard::Pending { jti, exp } => consume_jti(&config.path8, &jti, exp).await,
+        }
+    }
+}
+
+/// Verify a Path8 approval token and bind it to `transaction`, returning a guard
+/// whose JTI has **not** yet been consumed. The caller must await
+/// [`Path8ApprovalGuard::consume`] right before signing/sending.
+pub async fn verify_path8_approval(
     config: &Config,
     method: &str,
     approval_token: Option<&str>,
     transaction: &VersionedTransactionResolved,
-) -> Result<(), KoraError> {
+) -> Result<Path8ApprovalGuard, KoraError> {
     if !config.path8.requires_method(method) {
-        return Ok(());
+        return Ok(Path8ApprovalGuard::NotRequired);
     }
     let token = approval_token.ok_or_else(|| {
         KoraError::Unauthorized(format!("Path8 approval token required for {method}"))
@@ -50,8 +81,22 @@ pub async fn enforce_path8_approval(
             "Path8 approval token content hash mismatch".to_string(),
         ));
     }
-    consume_jti(&config.path8, &claims.jti, claims.exp).await?;
-    Ok(())
+    Ok(Path8ApprovalGuard::Pending { jti: claims.jti, exp: claims.exp })
+}
+
+/// Verify and immediately consume a Path8 approval in one step.
+///
+/// Prefer [`verify_path8_approval`] + [`Path8ApprovalGuard::consume`] on paths
+/// that run additional fallible pre-send checks, so a retryable rejection does
+/// not permanently burn the approval. Retained for callers with no work between
+/// verification and the irreversible step.
+pub async fn enforce_path8_approval(
+    config: &Config,
+    method: &str,
+    approval_token: Option<&str>,
+    transaction: &VersionedTransactionResolved,
+) -> Result<(), KoraError> {
+    verify_path8_approval(config, method, approval_token, transaction).await?.consume(config).await
 }
 
 fn verify_approval_token(config: &Path8Config, token: &str) -> Result<ApprovalClaims, KoraError> {
@@ -325,6 +370,91 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(verify_approval_token(&config, &token), Err(KoraError::Unauthorized(_))));
+    }
+
+    fn single_ix_fixture() -> VersionedTransactionResolved {
+        let payer = Pubkey::new_unique();
+        let program = Pubkey::new_unique();
+        let ix = Instruction::new_with_bytes(program, &[7, 7, 7], vec![]);
+        let message = VersionedMessage::Legacy(Message::new(&[ix], Some(&payer)));
+        let tx = crate::transaction::TransactionUtil::new_unsigned_versioned_transaction(message);
+        VersionedTransactionResolved::from_kora_built_transaction(&tx).unwrap()
+    }
+
+    fn path8_config_no_redis(secret_env: &str) -> Path8Config {
+        Path8Config {
+            enabled: true,
+            hmac_secret_env: secret_env.to_string(),
+            required_for_methods: vec!["signTransaction".to_string()],
+            redis_url: None,
+            ..Default::default()
+        }
+    }
+
+    // Regression for the burn-before-commit finding: verification must bind the
+    // approval to the transaction WITHOUT consuming the single-use JTI. With
+    // `redis_url = None`, the (Redis-backed) burn is impossible — so a `verify`
+    // that succeeds here proves the burn is deferred out of verification.
+    #[tokio::test]
+    async fn verify_defers_jti_burn_until_consume() {
+        std::env::set_var("PATH8_VERIFY_DEFER_SECRET", "secret");
+        let resolved = single_ix_fixture();
+        let ch = compute_canonical_instruction_hash(&resolved).unwrap();
+        let exp = chrono::Utc::now().timestamp() + 60;
+        let token = hs256_token(
+            "secret",
+            serde_json::json!({"sub":"u","sid":"s","iid":"i","ch": ch,"exp": exp,"jti":"jti-defer"}),
+        );
+
+        let mut config = crate::tests::config_mock::ConfigMockBuilder::new().build();
+        config.path8 = path8_config_no_redis("PATH8_VERIFY_DEFER_SECRET");
+
+        // Verify succeeds and yields a Pending guard — no Redis touched.
+        let guard = verify_path8_approval(&config, "signTransaction", Some(&token), &resolved)
+            .await
+            .unwrap();
+        assert!(matches!(guard, Path8ApprovalGuard::Pending { .. }));
+
+        // The burn is where Redis is required; with none configured it errors —
+        // confirming the irreversible step is isolated in `consume`, not verify.
+        let err = guard.consume(&config).await.unwrap_err();
+        assert!(matches!(err, KoraError::Unauthorized(_)));
+    }
+
+    // A content-hash mismatch must be rejected during verification, before any
+    // JTI burn is attempted (again provable via redis_url = None).
+    #[tokio::test]
+    async fn verify_rejects_hash_mismatch_before_burn() {
+        std::env::set_var("PATH8_VERIFY_MISMATCH_SECRET", "secret");
+        let resolved = single_ix_fixture();
+        let exp = chrono::Utc::now().timestamp() + 60;
+        let token = hs256_token(
+            "secret",
+            serde_json::json!({"sub":"u","sid":"s","iid":"i","ch":"ab".repeat(32),"exp": exp,"jti":"jti-x"}),
+        );
+
+        let mut config = crate::tests::config_mock::ConfigMockBuilder::new().build();
+        config.path8 = path8_config_no_redis("PATH8_VERIFY_MISMATCH_SECRET");
+
+        let err = verify_path8_approval(&config, "signTransaction", Some(&token), &resolved)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KoraError::Unauthorized(_)));
+    }
+
+    // Non-gated methods short-circuit to a no-op guard whose consume needs no Redis.
+    #[tokio::test]
+    async fn verify_not_required_yields_noop_guard() {
+        let resolved = single_ix_fixture();
+        let mut config = crate::tests::config_mock::ConfigMockBuilder::new().build();
+        config.path8 = Path8Config { enabled: false, ..Default::default() };
+
+        let guard = verify_path8_approval(&config, "signAndSendTransaction", None, &resolved)
+            .await
+            .unwrap();
+        assert!(matches!(guard, Path8ApprovalGuard::NotRequired));
+        // No-op consume succeeds with no Redis configured.
+        guard.consume(&config).await.unwrap();
     }
 
     #[test]

@@ -3448,7 +3448,11 @@ mod tests {
             ("testnet".into(), ProbeOutcome::Failed),
         ];
         let mut warnings = Vec::new();
-        ConfigValidator::emit_cluster_warnings(std::slice::from_ref(&mint), &probe_results, &mut warnings);
+        ConfigValidator::emit_cluster_warnings(
+            std::slice::from_ref(&mint),
+            &probe_results,
+            &mut warnings,
+        );
 
         assert_eq!(warnings.len(), 1);
         assert!(
@@ -3465,7 +3469,11 @@ mod tests {
         let probe_results: Vec<(String, ProbeOutcome)> =
             vec![("devnet".into(), ProbeOutcome::Failed), ("testnet".into(), ProbeOutcome::Failed)];
         let mut warnings = Vec::new();
-        ConfigValidator::emit_cluster_warnings(std::slice::from_ref(&mint), &probe_results, &mut warnings);
+        ConfigValidator::emit_cluster_warnings(
+            std::slice::from_ref(&mint),
+            &probe_results,
+            &mut warnings,
+        );
 
         assert_eq!(warnings.len(), 1);
         assert!(
@@ -3492,7 +3500,11 @@ mod tests {
             ("testnet".into(), ProbeOutcome::NotFound),
         ];
         let mut warnings = Vec::new();
-        ConfigValidator::emit_cluster_warnings(std::slice::from_ref(&mint), &probe_results, &mut warnings);
+        ConfigValidator::emit_cluster_warnings(
+            std::slice::from_ref(&mint),
+            &probe_results,
+            &mut warnings,
+        );
 
         assert_eq!(warnings.len(), 1);
         let w = &warnings[0];

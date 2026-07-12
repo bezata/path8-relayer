@@ -1,5 +1,5 @@
 use crate::{
-    path8::enforce_path8_approval,
+    path8::verify_path8_approval,
     rpc_server::middleware_utils::default_sig_verify,
     transaction::{
         RespondAfter, TransactionUtil, VersionedTransactionOps, VersionedTransactionResolved,
@@ -74,7 +74,10 @@ pub async fn sign_and_send_transaction(
     )
     .await?;
 
-    enforce_path8_approval(
+    // Verify + bind the Path8 approval, but do NOT burn its single-use JTI yet:
+    // the usage-limit check below is retryable, and burning before it would void
+    // a valid approval on a transient rejection.
+    let approval_guard = verify_path8_approval(
         config,
         "signAndSendTransaction",
         request.approval_token.as_deref(),
@@ -91,6 +94,11 @@ pub async fn sign_and_send_transaction(
         rpc_client,
     )
     .await?;
+
+    // Burn the JTI immediately before the irreversible network send — preserves
+    // the anti-replay / TOCTOU guarantee while no longer voiding approvals on a
+    // pre-send failure.
+    approval_guard.consume(config).await?;
 
     let (signature, signed_transaction) = resolved_transaction
         .sign_and_send_transaction(config, &signer, rpc_client, request.respond_after)

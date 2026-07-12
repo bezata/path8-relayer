@@ -1,5 +1,5 @@
 use crate::{
-    path8::enforce_path8_approval,
+    path8::verify_path8_approval,
     rpc_server::middleware_utils::default_sig_verify,
     transaction::{
         RespondAfter, TransactionUtil, VersionedTransactionOps, VersionedTransactionResolved,
@@ -67,7 +67,9 @@ pub async fn path8_execute(
     )
     .await?;
 
-    enforce_path8_approval(
+    // Verify + bind the approval; defer burning the single-use JTI until after
+    // the retryable usage-limit check (see `verify_path8_approval`).
+    let approval_guard = verify_path8_approval(
         config,
         "path8_execute",
         Some(request.approval_token.as_str()),
@@ -83,6 +85,9 @@ pub async fn path8_execute(
         rpc_client,
     )
     .await?;
+
+    // Burn the JTI immediately before the irreversible network send.
+    approval_guard.consume(config).await?;
 
     let (signature, signed_transaction) = resolved_transaction
         .sign_and_send_transaction(config, &signer, rpc_client, RespondAfter::Confirmed)
