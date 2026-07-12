@@ -34,6 +34,7 @@ enabled = false                    # Enable/disable caching (set to true with ur
 url = "redis://localhost:6379"    # Redis connection URL (uncomment and set when enabling cache)
 default_ttl = 300                  # Default TTL in seconds (5 minutes)
 account_ttl = 60                   # Account data TTL in seconds (1 minute)
+price_ttl = 0                     # Token price TTL in seconds (set to 0 to disable price caching while keeping account caching on)
 
 # Enable/disable specific RPC methods
 [kora.enabled_methods]
@@ -53,6 +54,12 @@ max_allowed_lamports = 1000000
 max_signatures = 10
 price_source = "Mock"
 allow_durable_transactions = false
+cross_cluster_check = false
+cross_cluster_endpoints = [
+    "https://api.mainnet-beta.solana.com",
+    "https://api.devnet.solana.com",
+    "https://api.testnet.solana.com",
+]
 
 allowed_programs = [
     "11111111111111111111111111111111",              # System Program
@@ -102,6 +109,8 @@ allow_initialize_account = true # Allow fee payer to initialize SPL token accoun
 allow_initialize_multisig = true # Allow fee payer to be signer in SPL token multisig initialization
 allow_freeze_account = true     # Allow fee payer to freeze SPL token accounts
 allow_thaw_account = true       # Allow fee payer to thaw SPL token accounts
+allow_withdraw_excess_lamports = true # Allow fee payer to be authority in SPL WithdrawExcessLamports
+allow_unwrap_lamports = true    # Allow fee payer to be authority in SPL UnwrapLamports
 
 [validation.fee_payer_policy.token_2022]
 allow_transfer = true           # Allow fee payer to be source in Token2022 transfers
@@ -116,6 +125,8 @@ allow_initialize_account = true # Allow fee payer to initialize Token2022 accoun
 allow_initialize_multisig = true # Allow fee payer to be signer in Token2022 multisig initialization
 allow_freeze_account = true     # Allow fee payer to freeze Token2022 accounts
 allow_thaw_account = true       # Allow fee payer to thaw Token2022 accounts
+allow_withdraw_excess_lamports = true # Allow fee payer to be authority in Token2022 WithdrawExcessLamports
+allow_unwrap_lamports = true    # Allow fee payer to be authority in Token2022 UnwrapLamports
 
 [validation.fee_payer_policy.alt]
 allow_create = false            # Allow fee payer to be authority/payer in ALT CreateLookupTable

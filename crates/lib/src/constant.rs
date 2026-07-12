@@ -41,6 +41,12 @@ pub const BPF_LOADER_UPGRADEABLE_PROGRAM_ID: Pubkey =
 // in Kora; policy enforcement lives in `LoaderV4InstructionPolicy`.
 pub const LOADER_V4_PROGRAM_ID: Pubkey = pubkey!("LoaderV411111111111111111111111111111111111");
 
+// Deploy registry (examples/devnet-deploy-paymaster/registry-program). The DeployAuthority
+// plugin gates loader mutations against this program's owner PDAs; gating is active only when
+// this id is in allowed_programs.
+pub const DEPLOY_REGISTRY_PROGRAM_ID: Pubkey =
+    pubkey!("CPoBCCbvawmR2S6joHjXgfFkh9pGqzSixBe2BaBwbVkx");
+
 // Metrics
 pub const DEFAULT_METRICS_ENDPOINT: &str = "/metrics";
 pub const DEFAULT_METRICS_PORT: u16 = 8080;
@@ -49,6 +55,7 @@ pub const DEFAULT_METRICS_SCRAPE_INTERVAL: u64 = 60;
 // Cache
 pub const DEFAULT_CACHE_DEFAULT_TTL: u64 = 300; // 5 minutes
 pub const DEFAULT_CACHE_ACCOUNT_TTL: u64 = 60; // 1 minute for account data
+pub const DEFAULT_CACHE_PRICE_TTL: u64 = 0; // 0 disables price caching
 pub const DEFAULT_FEE_PAYER_BALANCE_METRICS_EXPIRY_SECONDS: u64 = 30; // 30 seconds
 
 pub const DEFAULT_USAGE_LIMIT_MAX_TRANSACTIONS: u64 = 0; // 0 = unlimited
@@ -64,6 +71,16 @@ pub mod instruction_indexes {
         pub const REQUIRED_NUMBER_OF_ACCOUNTS: usize = 2;
         pub const PAYER_INDEX: usize = 0;
         pub const NEW_ACCOUNT_INDEX: usize = 1;
+    }
+
+    // Reverse of system_create_account: [new, funding], funding omitted when lamports == 0.
+    pub mod system_create_account_allow_prefund {
+        // bincode variant tag; absent from solana-system-interface 2.0.0.
+        pub const DISCRIMINATOR: u32 = 13;
+        pub const MIN_REQUIRED_NUMBER_OF_ACCOUNTS: usize = 1;
+        pub const REQUIRED_NUMBER_OF_ACCOUNTS_WITH_FUNDING: usize = 2;
+        pub const NEW_ACCOUNT_INDEX: usize = 0;
+        pub const FUNDING_INDEX: usize = 1;
     }
 
     pub mod system_transfer {
@@ -230,6 +247,18 @@ pub mod instruction_indexes {
         pub const ACCOUNT_INDEX: usize = 0;
         pub const PAYER_INDEX: usize = 1;
         pub const OWNER_INDEX: usize = 3;
+    }
+
+    pub mod spl_token_withdraw_excess_lamports {
+        pub const REQUIRED_NUMBER_OF_ACCOUNTS: usize = 3;
+        pub const AUTHORITY_INDEX: usize = 2;
+        pub const MULTISIG_SIGNERS_START_INDEX: usize = 3;
+    }
+
+    pub mod spl_token_unwrap_lamports {
+        pub const REQUIRED_NUMBER_OF_ACCOUNTS: usize = 3;
+        pub const AUTHORITY_INDEX: usize = 2;
+        pub const MULTISIG_SIGNERS_START_INDEX: usize = 3;
     }
 
     // ATA Create/CreateIdempotent account layout:

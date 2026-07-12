@@ -24,6 +24,9 @@ use crate::{
     transaction::VersionedTransactionResolved,
 };
 
+/// Discriminator of the p-token `Batch` instruction (`spl_token_interface` variant `Batch = 255`).
+const BATCH_DISCRIMINATOR: u8 = 255;
+
 // Instruction type that we support to parse from the transaction
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ParsedSystemInstructionType {
@@ -107,6 +110,8 @@ pub enum ParsedSPLInstructionType {
     SplTokenResume,
     SplTokenInitializeTransferHook,
     SplTokenTransferHookUpdate,
+    SplTokenWithdrawExcessLamports,
+    SplTokenUnwrapLamports,
     /// A Token-2022 extension instruction that was successfully deserialized but
     /// has no dedicated fee-payer parser.
     /// All account pubkeys are recorded so the validator can reject the transaction
@@ -227,6 +232,18 @@ pub enum ParsedSPLInstructionData {
         authority: Pubkey,
         multisig_signers: Vec<Pubkey>,
         program_id: Option<Pubkey>,
+    },
+    // WithdrawExcessLamports (both spl and spl 2022)
+    SplTokenWithdrawExcessLamports {
+        owner: Pubkey,
+        multisig_signers: Vec<Pubkey>,
+        is_2022: bool,
+    },
+    // UnwrapLamports
+    SplTokenUnwrapLamports {
+        owner: Pubkey,
+        multisig_signers: Vec<Pubkey>,
+        is_2022: bool,
     },
     /// Token-2022 extension instruction with no dedicated fee-payer parser.
     /// All accounts from the instruction are captured so the validator can check
@@ -372,6 +389,7 @@ pub enum ParsedBpfLoaderUpgradeableInstructionData {
         target: Pubkey,
         recipient: Pubkey,
         authority: Option<Pubkey>,
+        program: Option<Pubkey>,
     },
     ExtendProgram {
         program_data: Pubkey,
@@ -498,6 +516,7 @@ pub const PARSED_DATA_FIELD_FREEZE_ACCOUNT: &str = "freezeAccount";
 pub const PARSED_DATA_FIELD_THAW_ACCOUNT: &str = "thawAccount";
 pub const PARSED_DATA_FIELD_GET_ACCOUNT_DATA_SIZE: &str = "getAccountDataSize";
 pub const PARSED_DATA_FIELD_INITIALIZE_IMMUTABLE_OWNER: &str = "initializeImmutableOwner";
+pub const PARSED_DATA_FIELD_SYNC_NATIVE: &str = "syncNative";
 pub const PARSED_DATA_FIELD_EXTENSION_TYPES: &str = "extensionTypes";
 
 // Additional field names for new instructions
@@ -828,6 +847,102 @@ impl IxUtils {
                 accounts: instruction.accounts.iter().map(|a| a.pubkey).collect(),
             },
         );
+    }
+
+    fn is_spl_token_batch(instruction: &Instruction) -> bool {
+        instruction.program_id == spl_token_interface::ID
+            && instruction.data.first() == Some(&BATCH_DISCRIMINATOR)
+    }
+
+    fn expand_spl_token_batches(
+        instructions: &[Instruction],
+    ) -> Result<Vec<Instruction>, KoraError> {
+        if instructions.iter().any(|ix| {
+            ix.program_id == spl_token_2022_interface::ID
+                && ix.data.first() == Some(&BATCH_DISCRIMINATOR)
+        }) {
+            return Err(KoraError::InvalidTransaction(
+                "Token-2022 batch instructions are not supported".to_string(),
+            ));
+        }
+
+        if !instructions.iter().any(Self::is_spl_token_batch) {
+            return Ok(instructions.to_vec());
+        }
+
+        let mut expanded = Vec::with_capacity(instructions.len());
+        for instruction in instructions {
+            if Self::is_spl_token_batch(instruction) {
+                Self::decode_spl_token_batch(instruction, &mut expanded)?;
+            } else {
+                expanded.push(instruction.clone());
+            }
+        }
+        Ok(expanded)
+    }
+
+    fn decode_spl_token_batch(
+        batch: &Instruction,
+        out: &mut Vec<Instruction>,
+    ) -> Result<(), KoraError> {
+        let data = &batch.data[1..];
+        let mut data_cursor = 0usize;
+        let mut account_cursor = 0usize;
+
+        while data_cursor < data.len() {
+            if data_cursor + 2 > data.len() {
+                return Err(KoraError::InvalidTransaction(
+                    "Malformed p-token batch: truncated sub-instruction header".to_string(),
+                ));
+            }
+            let account_count = data[data_cursor] as usize;
+            let data_len = data[data_cursor + 1] as usize;
+            data_cursor += 2;
+
+            if data_cursor + data_len > data.len() {
+                return Err(KoraError::InvalidTransaction(
+                    "Malformed p-token batch: sub-instruction data out of bounds".to_string(),
+                ));
+            }
+            let sub_data = data[data_cursor..data_cursor + data_len].to_vec();
+            data_cursor += data_len;
+
+            if account_cursor + account_count > batch.accounts.len() {
+                return Err(KoraError::InvalidTransaction(
+                    "Malformed p-token batch: sub-instruction accounts out of bounds".to_string(),
+                ));
+            }
+            let sub_accounts =
+                batch.accounts[account_cursor..account_cursor + account_count].to_vec();
+            account_cursor += account_count;
+
+            if sub_data.first() == Some(&BATCH_DISCRIMINATOR) {
+                return Err(KoraError::InvalidTransaction(
+                    "Nested p-token batch instructions are not allowed".to_string(),
+                ));
+            }
+
+            if spl_token_interface::instruction::TokenInstruction::unpack(&sub_data).is_err() {
+                return Err(KoraError::InvalidTransaction(
+                    "Malformed p-token batch: unrecognized sub-instruction".to_string(),
+                ));
+            }
+
+            out.push(Instruction {
+                program_id: batch.program_id,
+                accounts: sub_accounts,
+                data: sub_data,
+            });
+        }
+
+        if account_cursor != batch.accounts.len() {
+            return Err(KoraError::InvalidTransaction(
+                "Malformed p-token batch: unused accounts remain after decoding sub-instructions"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     pub fn build_default_compiled_instruction(program_id_index: u8) -> CompiledInstruction {
@@ -1589,7 +1704,16 @@ impl IxUtils {
                 })
             }
             PARSED_DATA_FIELD_SET_AUTHORITY => {
-                let account = Self::get_field_as_pubkey(info, PARSED_DATA_FIELD_ACCOUNT)?;
+                // The parser names the target field by authority level: `account` for
+                // AccountOwner/CloseAccount, `mint` for all mint-level authority types
+                // (MintTokens, FreezeAccount, and the Token-2022 extension authorities).
+                // See agave's parse_token.rs `TokenInstruction::SetAuthority` arm.
+                let target_field = if info.get(PARSED_DATA_FIELD_ACCOUNT).is_some() {
+                    PARSED_DATA_FIELD_ACCOUNT
+                } else {
+                    PARSED_DATA_FIELD_MINT
+                };
+                let account = Self::get_field_as_pubkey(info, target_field)?;
                 let current_authority =
                     Self::get_field_as_pubkey(info, PARSED_DATA_FIELD_AUTHORITY)?;
 
@@ -1831,6 +1955,22 @@ impl IxUtils {
                     data,
                 })
             }
+            PARSED_DATA_FIELD_SYNC_NATIVE => {
+                let account = Self::get_field_as_pubkey(info, PARSED_DATA_FIELD_ACCOUNT)?;
+                let account_idx = Self::get_account_index(account_keys_hashmap, &account)?;
+
+                let data = if is_spl_token_program {
+                    spl_token_interface::instruction::TokenInstruction::SyncNative.pack()
+                } else {
+                    spl_token_2022_interface::instruction::TokenInstruction::SyncNative.pack()
+                };
+
+                Ok(CompiledInstruction {
+                    program_id_index,
+                    accounts: vec![account_idx],
+                    data,
+                })
+            }
             _ => {
                 Err(KoraError::InvalidTransaction(format!(
                     "Unrecognized SPL Token instruction type '{}' in CPI — cannot validate fee payer policy",
@@ -1959,11 +2099,45 @@ impl IxUtils {
                     Ok(SystemInstruction::UpgradeNonceAccount) => {
                         // Skip parsing
                     }
-                    _ => {}
+                    _ => {
+                        if let Some((lamports, owner)) =
+                            Self::parse_create_account_allow_prefund(&instruction.data)
+                        {
+                            let min_accounts = if lamports > 0 {
+                                instruction_indexes::system_create_account_allow_prefund::REQUIRED_NUMBER_OF_ACCOUNTS_WITH_FUNDING
+                            } else {
+                                instruction_indexes::system_create_account_allow_prefund::MIN_REQUIRED_NUMBER_OF_ACCOUNTS
+                            };
+                            validate_number_accounts!(instruction, min_accounts);
+                            let new_account = instruction.accounts[instruction_indexes::system_create_account_allow_prefund::NEW_ACCOUNT_INDEX].pubkey;
+                            let payer = if lamports > 0 {
+                                instruction.accounts[instruction_indexes::system_create_account_allow_prefund::FUNDING_INDEX].pubkey
+                            } else {
+                                new_account
+                            };
+                            parsed_instructions
+                                .entry(ParsedSystemInstructionType::SystemCreateAccount)
+                                .or_default()
+                                .push(ParsedSystemInstructionData::SystemCreateAccount {
+                                    lamports,
+                                    payer,
+                                    new_account,
+                                    owner,
+                                });
+                        }
+                    }
                 }
             }
         }
         Ok(parsed_instructions)
+    }
+
+    // Absent from system-interface 2.0.0; decode (tag, lamports, space, owner) by hand.
+    fn parse_create_account_allow_prefund(data: &[u8]) -> Option<(u64, Pubkey)> {
+        let (tag, lamports, _space, owner) =
+            bincode::deserialize::<(u32, u64, u64, Pubkey)>(data).ok()?;
+        (tag == instruction_indexes::system_create_account_allow_prefund::DISCRIMINATOR)
+            .then_some((lamports, owner))
     }
 
     pub fn parse_alt_instructions(
@@ -2441,6 +2615,11 @@ impl IxUtils {
                     } else {
                         None
                     };
+                    let program = if n >= ix::REQUIRED_NUMBER_OF_ACCOUNTS_WITH_PROGRAM {
+                        Some(instruction.accounts[ix::OPTIONAL_PROGRAM_INDEX].pubkey)
+                    } else {
+                        None
+                    };
                     parsed_instructions
                         .entry(ParsedBpfLoaderUpgradeableInstructionType::Close)
                         .or_default()
@@ -2448,6 +2627,7 @@ impl IxUtils {
                             target: instruction.accounts[ix::TARGET_INDEX].pubkey,
                             recipient: instruction.accounts[ix::RECIPIENT_INDEX].pubkey,
                             authority,
+                            program,
                         });
                 }
                 UpgradeableLoaderInstruction::ExtendProgram { additional_bytes } => {
@@ -2526,7 +2706,9 @@ impl IxUtils {
             Vec<ParsedSPLInstructionData>,
         > = HashMap::new();
 
-        for instruction in &transaction.all_instructions {
+        let expanded_instructions = Self::expand_spl_token_batches(&transaction.all_instructions)?;
+
+        for instruction in &expanded_instructions {
             let program_id = instruction.program_id;
 
             if program_id == spl_token_interface::ID {
@@ -2825,6 +3007,32 @@ impl IxUtils {
                                     multisig_signers: Self::extract_multisig_signers(instruction, 3),
                                     is_2022: false,
                                 });
+                        }
+                        spl_token_interface::instruction::TokenInstruction::WithdrawExcessLamports => {
+                            validate_number_accounts!(instruction, instruction_indexes::spl_token_withdraw_excess_lamports::REQUIRED_NUMBER_OF_ACCOUNTS);
+
+                            Self::push_parsed_spl_instruction(
+                                &mut parsed_instructions,
+                                ParsedSPLInstructionType::SplTokenWithdrawExcessLamports,
+                                ParsedSPLInstructionData::SplTokenWithdrawExcessLamports {
+                                    owner: instruction.accounts[instruction_indexes::spl_token_withdraw_excess_lamports::AUTHORITY_INDEX].pubkey,
+                                    multisig_signers: Self::extract_multisig_signers(instruction, instruction_indexes::spl_token_withdraw_excess_lamports::MULTISIG_SIGNERS_START_INDEX),
+                                    is_2022: false,
+                                },
+                            );
+                        }
+                        spl_token_interface::instruction::TokenInstruction::UnwrapLamports { .. } => {
+                            validate_number_accounts!(instruction, instruction_indexes::spl_token_unwrap_lamports::REQUIRED_NUMBER_OF_ACCOUNTS);
+
+                            Self::push_parsed_spl_instruction(
+                                &mut parsed_instructions,
+                                ParsedSPLInstructionType::SplTokenUnwrapLamports,
+                                ParsedSPLInstructionData::SplTokenUnwrapLamports {
+                                    owner: instruction.accounts[instruction_indexes::spl_token_unwrap_lamports::AUTHORITY_INDEX].pubkey,
+                                    multisig_signers: Self::extract_multisig_signers(instruction, instruction_indexes::spl_token_unwrap_lamports::MULTISIG_SIGNERS_START_INDEX),
+                                    is_2022: false,
+                                },
+                            );
                         }
                         _ => {}
                     };
@@ -3354,6 +3562,19 @@ impl IxUtils {
                                 }
                             }
                         }
+                        spl_token_2022_interface::instruction::TokenInstruction::WithdrawExcessLamports => {
+                            validate_number_accounts!(instruction, instruction_indexes::spl_token_withdraw_excess_lamports::REQUIRED_NUMBER_OF_ACCOUNTS);
+
+                            Self::push_parsed_spl_instruction(
+                                &mut parsed_instructions,
+                                ParsedSPLInstructionType::SplTokenWithdrawExcessLamports,
+                                ParsedSPLInstructionData::SplTokenWithdrawExcessLamports {
+                                    owner: instruction.accounts[instruction_indexes::spl_token_withdraw_excess_lamports::AUTHORITY_INDEX].pubkey,
+                                    multisig_signers: Self::extract_multisig_signers(instruction, instruction_indexes::spl_token_withdraw_excess_lamports::MULTISIG_SIGNERS_START_INDEX),
+                                    is_2022: true,
+                                },
+                            );
+                        }
                         spl_token_2022_interface::instruction::TokenInstruction::ConfidentialTransferExtension
                         | spl_token_2022_interface::instruction::TokenInstruction::ConfidentialTransferFeeExtension
                         | spl_token_2022_interface::instruction::TokenInstruction::ConfidentialMintBurnExtension => {
@@ -3379,7 +3600,19 @@ impl IxUtils {
 mod tests {
 
     use super::*;
-    use solana_sdk::message::{AccountKeys, Message};
+    use crate::{
+        constant::instruction_indexes::system_create_account_allow_prefund::DISCRIMINATOR,
+        transaction::versioned_transaction::VersionedTransactionResolved,
+    };
+    use solana_sdk::{
+        instruction::{AccountMeta, Instruction},
+        message::{AccountKeys, Message, VersionedMessage},
+        signature::{Keypair, Signer},
+        transaction::VersionedTransaction,
+    };
+    use solana_system_interface::{
+        instruction::SystemInstruction, program::ID as SYSTEM_PROGRAM_ID,
+    };
     use solana_transaction_status::parse_instruction;
 
     fn create_parsed_system_transfer(
@@ -3724,6 +3957,59 @@ mod tests {
             authority,
             &[],
         )?;
+
+        let message = Message::new(&[solana_instruction], None);
+        let compiled_instruction = &message.instructions[0];
+
+        let account_keys_for_parsing = AccountKeys::new(&message.account_keys, None);
+
+        let parsed = parse_instruction::parse(
+            &spl_token_interface::ID,
+            compiled_instruction,
+            &account_keys_for_parsing,
+            None,
+        )?;
+
+        Ok(parsed)
+    }
+
+    fn create_parsed_spl_token_set_authority(
+        owned: &Pubkey,
+        authority_type: spl_token_interface::instruction::AuthorityType,
+        new_authority: &Pubkey,
+        authority: &Pubkey,
+    ) -> Result<solana_transaction_status_client_types::ParsedInstruction, Box<dyn std::error::Error>>
+    {
+        let solana_instruction = spl_token_interface::instruction::set_authority(
+            &spl_token_interface::ID,
+            owned,
+            Some(new_authority),
+            authority_type,
+            authority,
+            &[],
+        )?;
+
+        let message = Message::new(&[solana_instruction], None);
+        let compiled_instruction = &message.instructions[0];
+
+        let account_keys_for_parsing = AccountKeys::new(&message.account_keys, None);
+
+        let parsed = parse_instruction::parse(
+            &spl_token_interface::ID,
+            compiled_instruction,
+            &account_keys_for_parsing,
+            None,
+        )?;
+
+        Ok(parsed)
+    }
+
+    fn create_parsed_spl_token_sync_native(
+        account: &Pubkey,
+    ) -> Result<solana_transaction_status_client_types::ParsedInstruction, Box<dyn std::error::Error>>
+    {
+        let solana_instruction =
+            spl_token_interface::instruction::sync_native(&spl_token_interface::ID, account)?;
 
         let message = Message::new(&[solana_instruction], None);
         let compiled_instruction = &message.instructions[0];
@@ -4256,6 +4542,123 @@ mod tests {
     }
 
     #[test]
+    fn test_create_account_allow_prefund_bincode_tag() {
+        // Anchors the hand-coded tag 13: prefund follows UpgradeNonceAccount, so tag 12 here
+        // proves it. Fails loud if upstream reorders the enum.
+        let upgrade = bincode::serialize(&SystemInstruction::UpgradeNonceAccount).unwrap();
+        assert_eq!(&upgrade[0..4], &12u32.to_le_bytes());
+    }
+
+    fn build_create_account_allow_prefund_ix(
+        new_account: &Pubkey,
+        funder: &Pubkey,
+        lamports: u64,
+        space: u64,
+        owner: &Pubkey,
+    ) -> Instruction {
+        let mut accounts = vec![AccountMeta::new(*new_account, true)];
+        if lamports > 0 {
+            accounts.push(AccountMeta::new(*funder, true));
+        }
+        Instruction {
+            program_id: SYSTEM_PROGRAM_ID,
+            accounts,
+            data: bincode::serialize(&(DISCRIMINATOR, lamports, space, *owner)).unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_parse_system_instructions_create_account_allow_prefund() {
+        let funder = Keypair::new();
+        let new_account = Keypair::new();
+        let owner = Pubkey::new_unique();
+        let lamports = 2_000_000u64;
+
+        let instruction = build_create_account_allow_prefund_ix(
+            &new_account.pubkey(),
+            &funder.pubkey(),
+            lamports,
+            165,
+            &owner,
+        );
+
+        let message =
+            VersionedMessage::Legacy(Message::new(&[instruction], Some(&funder.pubkey())));
+        let tx = VersionedTransaction::try_new(message, &[&funder, &new_account]).unwrap();
+
+        let resolved_tx = VersionedTransactionResolved::from_kora_built_transaction(&tx)
+            .expect("Failed to create resolved transaction");
+
+        let parsed_instructions = IxUtils::parse_system_instructions(&resolved_tx)
+            .expect("Failed to parse system instructions");
+
+        let creates = parsed_instructions
+            .get(&ParsedSystemInstructionType::SystemCreateAccount)
+            .expect("Expected SystemCreateAccount instructions");
+
+        assert_eq!(creates.len(), 1);
+        match &creates[0] {
+            ParsedSystemInstructionData::SystemCreateAccount {
+                lamports: parsed_lamports,
+                payer: parsed_payer,
+                new_account: parsed_new_account,
+                owner: parsed_owner,
+            } => {
+                assert_eq!(*parsed_lamports, lamports);
+                assert_eq!(*parsed_payer, funder.pubkey());
+                assert_eq!(*parsed_new_account, new_account.pubkey());
+                assert_eq!(*parsed_owner, owner);
+            }
+            _ => panic!("Expected SystemCreateAccount variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_system_instructions_create_account_allow_prefund_no_funding() {
+        // lamports == 0 omits the funding account; the new account is the only signer and
+        // is recorded as the payer so policy and outflow accounting treat it consistently.
+        let new_account = Keypair::new();
+        let owner = Pubkey::new_unique();
+
+        let instruction = build_create_account_allow_prefund_ix(
+            &new_account.pubkey(),
+            &new_account.pubkey(),
+            0,
+            165,
+            &owner,
+        );
+
+        let message =
+            VersionedMessage::Legacy(Message::new(&[instruction], Some(&new_account.pubkey())));
+        let tx = VersionedTransaction::try_new(message, &[&new_account]).unwrap();
+
+        let resolved_tx = VersionedTransactionResolved::from_kora_built_transaction(&tx)
+            .expect("Failed to create resolved transaction");
+
+        let parsed_instructions = IxUtils::parse_system_instructions(&resolved_tx)
+            .expect("Failed to parse system instructions");
+
+        let creates = parsed_instructions
+            .get(&ParsedSystemInstructionType::SystemCreateAccount)
+            .expect("Expected SystemCreateAccount instructions");
+
+        assert_eq!(creates.len(), 1);
+        match &creates[0] {
+            ParsedSystemInstructionData::SystemCreateAccount {
+                lamports: parsed_lamports,
+                payer: parsed_payer,
+                new_account: parsed_new_account,
+                ..
+            } => {
+                assert_eq!(*parsed_lamports, 0);
+                assert_eq!(*parsed_payer, new_account.pubkey());
+                assert_eq!(*parsed_new_account, new_account.pubkey());
+            }
+            _ => panic!("Expected SystemCreateAccount variant"),
+        }
+    }
+
+    #[test]
     fn test_parse_alt_instructions_freeze_lookup_table() {
         use crate::transaction::versioned_transaction::VersionedTransactionResolved;
         use solana_address_lookup_table_interface::instruction::freeze_lookup_table;
@@ -4745,6 +5148,254 @@ mod tests {
             );
         } else {
             panic!("Expected SplTokenUnknownExtension variant");
+        }
+    }
+
+    #[test]
+    fn test_parse_spl_token_batch_extracts_inner_transfer() {
+        use crate::transaction::versioned_transaction::VersionedTransactionResolved;
+        use solana_message::{Message, VersionedMessage};
+        use solana_sdk::{
+            signature::{Keypair, Signer},
+            transaction::VersionedTransaction,
+        };
+
+        let payer = Keypair::new();
+        let source = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+
+        let transfer_ix = spl_token_interface::instruction::transfer(
+            &spl_token_interface::id(),
+            &source,
+            &destination,
+            &payer.pubkey(),
+            &[],
+            4242,
+        )
+        .unwrap();
+        let batch_ix =
+            spl_token_interface::instruction::batch(&spl_token_interface::id(), &[transfer_ix])
+                .unwrap();
+
+        let message = VersionedMessage::Legacy(Message::new(&[batch_ix], Some(&payer.pubkey())));
+        let tx = VersionedTransaction::try_new(message, &[&payer]).unwrap();
+        let resolved_tx = VersionedTransactionResolved::from_kora_built_transaction(&tx).unwrap();
+
+        let parsed = IxUtils::parse_token_instructions(&resolved_tx).unwrap();
+        let transfers = parsed
+            .get(&ParsedSPLInstructionType::SplTokenTransfer)
+            .expect("Batched transfer must be decoded, not skipped");
+        assert_eq!(transfers.len(), 1);
+        if let ParsedSPLInstructionData::SplTokenTransfer { amount, owner, is_2022, .. } =
+            &transfers[0]
+        {
+            assert_eq!(*amount, 4242);
+            assert_eq!(*owner, payer.pubkey());
+            assert!(!*is_2022);
+        } else {
+            panic!("Expected SplTokenTransfer variant");
+        }
+    }
+
+    #[test]
+    fn test_parse_spl_token_batch_rejects_nested_batch() {
+        use crate::transaction::versioned_transaction::VersionedTransactionResolved;
+        use solana_message::{Message, VersionedMessage};
+        use solana_sdk::{
+            signature::{Keypair, Signer},
+            transaction::VersionedTransaction,
+        };
+
+        let payer = Keypair::new();
+        let source = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+
+        let transfer_ix = spl_token_interface::instruction::transfer(
+            &spl_token_interface::id(),
+            &source,
+            &destination,
+            &payer.pubkey(),
+            &[],
+            1,
+        )
+        .unwrap();
+        let inner_batch =
+            spl_token_interface::instruction::batch(&spl_token_interface::id(), &[transfer_ix])
+                .unwrap();
+        let outer_batch =
+            spl_token_interface::instruction::batch(&spl_token_interface::id(), &[inner_batch])
+                .unwrap();
+
+        let message = VersionedMessage::Legacy(Message::new(&[outer_batch], Some(&payer.pubkey())));
+        let tx = VersionedTransaction::try_new(message, &[&payer]).unwrap();
+        let resolved_tx = VersionedTransactionResolved::from_kora_built_transaction(&tx).unwrap();
+
+        assert!(IxUtils::parse_token_instructions(&resolved_tx).is_err());
+    }
+
+    #[test]
+    fn test_parse_spl_token_batch_rejects_trailing_accounts() {
+        use crate::transaction::versioned_transaction::VersionedTransactionResolved;
+        use solana_message::{Message, VersionedMessage};
+        use solana_sdk::{
+            instruction::AccountMeta,
+            signature::{Keypair, Signer},
+            transaction::VersionedTransaction,
+        };
+
+        let payer = Keypair::new();
+        let source = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+
+        let transfer_ix = spl_token_interface::instruction::transfer(
+            &spl_token_interface::id(),
+            &source,
+            &destination,
+            &payer.pubkey(),
+            &[],
+            1,
+        )
+        .unwrap();
+        let mut batch_ix =
+            spl_token_interface::instruction::batch(&spl_token_interface::id(), &[transfer_ix])
+                .unwrap();
+        batch_ix.accounts.push(AccountMeta::new_readonly(Pubkey::new_unique(), false));
+
+        let message = VersionedMessage::Legacy(Message::new(&[batch_ix], Some(&payer.pubkey())));
+        let tx = VersionedTransaction::try_new(message, &[&payer]).unwrap();
+        let resolved_tx = VersionedTransactionResolved::from_kora_built_transaction(&tx).unwrap();
+
+        assert!(IxUtils::parse_token_instructions(&resolved_tx).is_err());
+    }
+
+    #[test]
+    fn test_parse_spl_token_batch_rejects_unrecognized_sub_instruction() {
+        use crate::transaction::versioned_transaction::VersionedTransactionResolved;
+        use solana_message::{Message, VersionedMessage};
+        use solana_sdk::{
+            instruction::Instruction,
+            signature::{Keypair, Signer},
+            transaction::VersionedTransaction,
+        };
+
+        let payer = Keypair::new();
+        let junk_ix =
+            Instruction { program_id: spl_token_interface::id(), accounts: vec![], data: vec![99] };
+        let batch_ix =
+            spl_token_interface::instruction::batch(&spl_token_interface::id(), &[junk_ix])
+                .unwrap();
+
+        let message = VersionedMessage::Legacy(Message::new(&[batch_ix], Some(&payer.pubkey())));
+        let tx = VersionedTransaction::try_new(message, &[&payer]).unwrap();
+        let resolved_tx = VersionedTransactionResolved::from_kora_built_transaction(&tx).unwrap();
+
+        assert!(IxUtils::parse_token_instructions(&resolved_tx).is_err());
+    }
+
+    #[test]
+    fn test_parse_rejects_token_2022_batch() {
+        use crate::transaction::versioned_transaction::VersionedTransactionResolved;
+        use solana_message::{Message, VersionedMessage};
+        use solana_sdk::{
+            instruction::Instruction,
+            signature::{Keypair, Signer},
+            transaction::VersionedTransaction,
+        };
+
+        let payer = Keypair::new();
+        let fake_t22_batch = Instruction {
+            program_id: spl_token_2022_interface::id(),
+            accounts: vec![],
+            data: vec![BATCH_DISCRIMINATOR],
+        };
+
+        let message =
+            VersionedMessage::Legacy(Message::new(&[fake_t22_batch], Some(&payer.pubkey())));
+        let tx = VersionedTransaction::try_new(message, &[&payer]).unwrap();
+        let resolved_tx = VersionedTransactionResolved::from_kora_built_transaction(&tx).unwrap();
+
+        assert!(IxUtils::parse_token_instructions(&resolved_tx).is_err());
+    }
+
+    #[test]
+    fn test_parse_spl_token_withdraw_excess_lamports() {
+        use crate::transaction::versioned_transaction::VersionedTransactionResolved;
+        use solana_message::{Message, VersionedMessage};
+        use solana_sdk::{
+            signature::{Keypair, Signer},
+            transaction::VersionedTransaction,
+        };
+
+        let payer = Keypair::new();
+        let account = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+
+        let ix = spl_token_interface::instruction::withdraw_excess_lamports(
+            &spl_token_interface::id(),
+            &account,
+            &destination,
+            &payer.pubkey(),
+            &[],
+        )
+        .unwrap();
+
+        let message = VersionedMessage::Legacy(Message::new(&[ix], Some(&payer.pubkey())));
+        let tx = VersionedTransaction::try_new(message, &[&payer]).unwrap();
+        let resolved_tx = VersionedTransactionResolved::from_kora_built_transaction(&tx).unwrap();
+
+        let parsed = IxUtils::parse_token_instructions(&resolved_tx).unwrap();
+        let entries = parsed
+            .get(&ParsedSPLInstructionType::SplTokenWithdrawExcessLamports)
+            .expect("WithdrawExcessLamports must be parsed");
+        assert_eq!(entries.len(), 1);
+        if let ParsedSPLInstructionData::SplTokenWithdrawExcessLamports { owner, is_2022, .. } =
+            &entries[0]
+        {
+            assert_eq!(*owner, payer.pubkey());
+            assert!(!*is_2022);
+        } else {
+            panic!("Expected SplTokenWithdrawExcessLamports variant");
+        }
+    }
+
+    #[test]
+    fn test_parse_spl_token_unwrap_lamports() {
+        use crate::transaction::versioned_transaction::VersionedTransactionResolved;
+        use solana_message::{Message, VersionedMessage};
+        use solana_sdk::{
+            signature::{Keypair, Signer},
+            transaction::VersionedTransaction,
+        };
+
+        let payer = Keypair::new();
+        let account = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+
+        let ix = spl_token_interface::instruction::unwrap_lamports(
+            &spl_token_interface::id(),
+            &account,
+            &destination,
+            &payer.pubkey(),
+            &[],
+            Some(500),
+        )
+        .unwrap();
+
+        let message = VersionedMessage::Legacy(Message::new(&[ix], Some(&payer.pubkey())));
+        let tx = VersionedTransaction::try_new(message, &[&payer]).unwrap();
+        let resolved_tx = VersionedTransactionResolved::from_kora_built_transaction(&tx).unwrap();
+
+        let parsed = IxUtils::parse_token_instructions(&resolved_tx).unwrap();
+        let entries = parsed
+            .get(&ParsedSPLInstructionType::SplTokenUnwrapLamports)
+            .expect("UnwrapLamports must be parsed");
+        assert_eq!(entries.len(), 1);
+        if let ParsedSPLInstructionData::SplTokenUnwrapLamports { owner, is_2022, .. } = &entries[0]
+        {
+            assert_eq!(*owner, payer.pubkey());
+            assert!(!*is_2022);
+        } else {
+            panic!("Expected SplTokenUnwrapLamports variant");
         }
     }
 
@@ -5453,6 +6104,92 @@ mod tests {
         let compiled = result.unwrap();
         assert_eq!(compiled.program_id_index, 0);
         assert_eq!(compiled.accounts, vec![1, 2, 3]); // account, destination, authority indices
+        assert_eq!(compiled.data, instruction.data);
+    }
+
+    #[test]
+    fn test_reconstruct_spl_token_set_authority_on_token_account() {
+        let token_account = Pubkey::new_unique();
+        let new_authority = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let token_program_id = spl_token_interface::ID;
+        let account_keys = vec![token_program_id, token_account, authority];
+
+        // AccountOwner is account-level, so the parser emits the target under `account`.
+        let solana_parsed = create_parsed_spl_token_set_authority(
+            &token_account,
+            spl_token_interface::instruction::AuthorityType::AccountOwner,
+            &new_authority,
+            &authority,
+        )
+        .expect("Failed to create parsed instruction");
+
+        let result = IxUtils::reconstruct_spl_token_instruction(
+            &solana_parsed,
+            &IxUtils::build_account_keys_hashmap(&account_keys),
+        );
+
+        assert!(
+            result.is_ok(),
+            "account-level setAuthority should reconstruct: {:?}",
+            result.err()
+        );
+        let compiled = result.unwrap();
+        assert_eq!(compiled.program_id_index, 0);
+        assert_eq!(compiled.accounts, vec![1, 2]); // target account, current authority indices
+    }
+
+    #[test]
+    fn test_reconstruct_spl_token_set_authority_on_mint() {
+        let mint = Pubkey::new_unique();
+        let new_authority = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let token_program_id = spl_token_interface::ID;
+        let account_keys = vec![token_program_id, mint, authority];
+
+        // FreezeAccount is mint-level, so the parser emits the target under `mint`
+        // instead of `account` (agave parse_token.rs, TokenInstruction::SetAuthority).
+        let solana_parsed = create_parsed_spl_token_set_authority(
+            &mint,
+            spl_token_interface::instruction::AuthorityType::FreezeAccount,
+            &new_authority,
+            &authority,
+        )
+        .expect("Failed to create parsed instruction");
+
+        let result = IxUtils::reconstruct_spl_token_instruction(
+            &solana_parsed,
+            &IxUtils::build_account_keys_hashmap(&account_keys),
+        );
+
+        assert!(result.is_ok(), "mint-level setAuthority should reconstruct: {:?}", result.err());
+        let compiled = result.unwrap();
+        assert_eq!(compiled.program_id_index, 0);
+        assert_eq!(compiled.accounts, vec![1, 2]); // mint, current authority indices
+    }
+
+    #[test]
+    fn test_reconstruct_spl_token_sync_native_instruction() {
+        let account = Pubkey::new_unique();
+        let token_program_id = spl_token_interface::ID;
+        let account_keys = vec![token_program_id, account];
+
+        let instruction =
+            spl_token_interface::instruction::sync_native(&spl_token_interface::ID, &account)
+                .expect("Failed to create sync_native instruction");
+
+        let solana_parsed = create_parsed_spl_token_sync_native(&account)
+            .expect("Failed to create parsed instruction");
+
+        let result = IxUtils::reconstruct_spl_token_instruction(
+            &solana_parsed,
+            &IxUtils::build_account_keys_hashmap(&account_keys),
+        );
+
+        assert!(result.is_ok(), "syncNative CPI should reconstruct: {:?}", result.err());
+        let compiled = result.unwrap();
+        assert_eq!(compiled.program_id_index, 0);
+        assert_eq!(compiled.accounts, vec![1]);
         assert_eq!(compiled.data, instruction.data);
     }
 

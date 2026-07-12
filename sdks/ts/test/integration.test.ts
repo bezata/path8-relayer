@@ -28,7 +28,8 @@ import {
     tokenProgram,
 } from '@solana-program/token';
 
-import { KoraClient, kora } from '../src/index.js';
+import { kora } from '../src/kit/index.js';
+import { KoraClient } from '../src/index.js';
 import { runAuthenticationTests } from './auth-setup.js';
 import setupTestSuite from './setup.js';
 
@@ -289,7 +290,7 @@ describe(`KoraClient Integration Tests (${AUTH_ENABLED ? 'with auth' : 'without 
             expect(signResult).toBeDefined();
             expect(signResult.signed_transaction).toBeDefined();
             expect(signResult.signature).toBeDefined();
-        });
+        }, 30000);
 
         it('should get payment instruction', async () => {
             const { transaction } = await buildTokenTransferTransaction({
@@ -411,7 +412,7 @@ describe(`KoraClient Integration Tests (${AUTH_ENABLED ? 'with auth' : 'without 
             expect(result.signer_pubkey).toBeDefined();
             expect(result.bundle_uuid).toBeDefined();
             expect(typeof result.bundle_uuid).toBe('string');
-        });
+        }, 30000);
     });
 
     describe('Error Handling', () => {

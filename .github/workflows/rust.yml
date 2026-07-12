@@ -46,18 +46,33 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        test-group: [regular, auth, payment_address, multi_signer]
+        # external excluded: hits live Jupiter API
+        test-group:
+          [
+            regular,
+            auth,
+            payment_address,
+            multi_signer,
+            fee_payer_policy,
+            free_signing,
+            lighthouse,
+            loader_v3_deploy,
+            usage_limit,
+          ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # test_runner shells out to `cargo test` per phase, so the integration
+      # jobs need the toolchain and the incremental build cache even though
+      # they download prebuilt kora/test_runner binaries
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "rust-integration"
+          shared-key: "rust-integration-build"
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.build.outputs.artifact-name }}
           path: target/debug/

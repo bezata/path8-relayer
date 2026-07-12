@@ -2,12 +2,13 @@ mod args;
 
 use args::GlobalArgs;
 use clap::{Parser, Subcommand};
+
 use kora_lib::{
     admin::token_util::initialize_atas,
     error::KoraError,
     log::LoggingFormat,
     rpc::get_rpc_client,
-    rpc_server::{run_rpc_server, server::ServerHandles, KoraRpc, RpcArgs},
+    rpc_server::{run_rpc_server, KoraRpc, RpcArgs},
     signer::init::init_signers,
     state::init_config,
     validator::config_validator::ConfigValidator,
@@ -123,29 +124,34 @@ async fn main() -> Result<(), KoraError> {
 
     match cli.command {
         Some(Commands::Config { config_command }) => {
-            match config_command {
+            let validation_result = match config_command {
                 ConfigCommands::Validate { signers_config } => {
-                    let _ = ConfigValidator::validate_with_result_and_signers(
+                    ConfigValidator::validate_with_result_and_signers(
                         rpc_client.as_ref(),
                         true,
                         signers_config.as_ref(),
                     )
-                    .await;
+                    .await
                 }
                 ConfigCommands::ValidateWithRpc { signers_config } => {
-                    let _ = ConfigValidator::validate_with_result_and_signers(
+                    ConfigValidator::validate_with_result_and_signers(
                         rpc_client.as_ref(),
                         false,
                         signers_config.as_ref(),
                     )
-                    .await;
+                    .await
                 }
+            };
+            match validation_result {
+                Ok(_) => std::process::exit(0),
+                Err(_) => std::process::exit(1),
             }
-            std::process::exit(0);
         }
         Some(Commands::Rpc { rpc_command }) => {
             match rpc_command {
                 RpcCommands::Start { rpc_args } => {
+                    rpc_args.auth_args.apply_to_env();
+
                     // Validate config and signers before starting server
                     match ConfigValidator::validate_with_result_and_signers(
                         rpc_client.as_ref(),
@@ -187,31 +193,12 @@ async fn main() -> Result<(), KoraError> {
 
                     let kora_rpc = KoraRpc::new(rpc_client);
 
-                    let ServerHandles { rpc_handle, metrics_handle, balance_tracker_handle } =
-                        run_rpc_server(kora_rpc, rpc_args.port).await?;
+                    let handles = run_rpc_server(kora_rpc, rpc_args.port).await?;
 
-                    if let Err(e) = tokio::signal::ctrl_c().await {
-                        panic!("Error waiting for Ctrl+C signal: {e:?}");
-                    }
+                    wait_for_shutdown_signal().await;
                     println!("Shutting down server...");
 
-                    // Stop the balance tracker task
-                    if let Some(handle) = balance_tracker_handle {
-                        log::info!("Stopping balance tracker background task...");
-                        handle.abort();
-                    }
-
-                    // Stop the RPC server
-                    if let Err(e) = rpc_handle.stop() {
-                        panic!("Error stopping RPC server: {e:?}");
-                    }
-
-                    // Stop the metrics server if running
-                    if let Some(handle) = metrics_handle {
-                        if let Err(e) = handle.stop() {
-                            panic!("Error stopping metrics server: {e:?}");
-                        }
-                    }
+                    handles.shutdown(rpc_args.port).await;
                 }
                 RpcCommands::InitializeAtas {
                     rpc_args,
@@ -288,6 +275,27 @@ async fn main() -> Result<(), KoraError> {
 
 fn print_error(message: &str) {
     eprintln!("Error: {message}");
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to install SIGTERM handler");
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(e) = result {
+                panic!("Error waiting for Ctrl+C signal: {e:?}");
+            }
+        }
+        _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        panic!("Error waiting for Ctrl+C signal: {e:?}");
+    }
 }
 
 fn setup_logging(format: &LoggingFormat) {

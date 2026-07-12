@@ -9,10 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::time::sleep;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "docs", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TokenPrice {
-    #[cfg_attr(feature = "docs", schema(value_type = String))]
+    #[schema(value_type = String)]
     pub price: Decimal,
     pub confidence: f64,
     pub source: PriceSource,
@@ -20,11 +19,21 @@ pub struct TokenPrice {
     pub block_id: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "docs", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub enum PriceSource {
     Jupiter,
     Mock,
+}
+
+impl PriceSource {
+    /// Stable lowercase identifier used in cache keys; changing these values
+    /// invalidates existing Redis entries.
+    pub fn as_cache_key(&self) -> &'static str {
+        match self {
+            PriceSource::Jupiter => "jupiter",
+            PriceSource::Mock => "mock",
+        }
+    }
 }
 
 #[automock]
@@ -47,6 +56,9 @@ pub struct RetryingPriceOracle {
     oracle: Arc<dyn PriceOracle + Send + Sync>,
 }
 
+const ORACLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const ORACLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub fn get_price_oracle(
     source: PriceSource,
 ) -> Result<Arc<dyn PriceOracle + Send + Sync>, KoraError> {
@@ -62,7 +74,12 @@ impl RetryingPriceOracle {
         base_delay: Duration,
         oracle: Arc<dyn PriceOracle + Send + Sync>,
     ) -> Self {
-        Self { client: Client::new(), max_retries, base_delay, oracle }
+        let client = Client::builder()
+            .connect_timeout(ORACLE_CONNECT_TIMEOUT)
+            .timeout(ORACLE_REQUEST_TIMEOUT)
+            .build()
+            .expect("Failed to build reqwest client");
+        Self { client, max_retries, base_delay, oracle }
     }
 
     pub async fn get_token_price(&self, mint_address: &str) -> Result<TokenPrice, KoraError> {
@@ -109,6 +126,7 @@ impl RetryingPriceOracle {
 mod tests {
 
     use super::*;
+    use crate::tests::oracle_mock::{spawn_hanging_server, HangingOracle};
     use std::time::Duration;
 
     #[tokio::test]
@@ -199,5 +217,24 @@ mod tests {
         let result = oracle.get_token_price("missing_mint").await;
         assert!(result.is_err());
         assert!(matches!(result.err(), Some(KoraError::InternalServerError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_retrying_price_oracle_times_out_on_hanging_request() {
+        let server_url = spawn_hanging_server();
+
+        let hanging_oracle = Arc::new(HangingOracle { url: server_url });
+        let retrying_oracle =
+            RetryingPriceOracle::new(1, Duration::from_millis(10), hanging_oracle);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            retrying_oracle.get_token_prices(&["dummy_mint".to_string()]),
+        )
+        .await;
+
+        assert!(result.is_ok(), "Expected request to actually timeout within the window");
+        let inner_result = result.unwrap();
+        assert!(inner_result.is_err());
     }
 }

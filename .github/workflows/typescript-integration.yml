@@ -50,18 +50,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        test-group: [typescript_basic, typescript_auth]
+        test-group: [typescript_basic, typescript_auth, typescript_free]
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "typescript-integration-${{ matrix.test-group }}"
+      - uses: actions/checkout@v7
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.build.outputs.artifact-name }}
           path: target/debug/
@@ -73,12 +67,12 @@ jobs:
         uses: ./.github/actions/setup-solana
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "lts/*"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6.0.7
         with:
           version: 10.12.3
           run_install: false
@@ -88,7 +82,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
 
       - name: Setup pnpm cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: ${{ env.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('sdks/ts/pnpm-lock.yaml') }}

@@ -1,0 +1,12 @@
+FROM rustlang/rust:nightly
+
+RUN cargo install \
+    --git https://github.com/solana-foundation/kora \
+    --branch main \
+    --bin devnet_deploy_reaper \
+    devnet-deploy-paymaster
+
+COPY kora.toml ./
+COPY signers.toml ./
+
+ENTRYPOINT ["devnet_deploy_reaper", "--config", "kora.toml", "--signers-config", "signers.toml"]

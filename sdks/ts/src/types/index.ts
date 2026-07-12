@@ -19,9 +19,20 @@ export interface SignTransactionRequest {
 }
 
 /**
+ * The transaction lifecycle milestone the server waits for before responding,
+ * ordered by increasing assurance: `signed` < `sent` < `confirmed`:
+ * - `confirmed`: wait for on-chain confirmation (default)
+ * - `sent`: return once the RPC node accepts the transaction
+ * - `signed`: return as soon as signing completes and broadcast in the background
+ */
+export type RespondAfter = 'confirmed' | 'sent' | 'signed';
+
+/**
  * Parameters for signing and sending a transaction.
  */
 export interface SignAndSendTransactionRequest {
+    /** Optional milestone to wait for before responding (defaults to "confirmed") */
+    respond_after?: RespondAfter;
     /** Optional signer verification during transaction simulation (defaults to false) */
     sig_verify?: boolean;
     /** Optional signer address for the transaction */
@@ -257,8 +268,8 @@ export type PriceSource = 'Jupiter' | 'Mock';
  * Validation configuration for the Kora server.
  */
 export interface ValidationConfig {
-    /** List of allowed Solana program IDs */
-    allowed_programs: string[];
+    /** List of allowed Solana program IDs, or "All" to allow any program. */
+    allowed_programs: 'All' | string[];
     /** List of SPL tokens accepted for paid transactions */
     allowed_spl_paid_tokens: string[];
     /** List of allowed token mint addresses for fee payment */
@@ -297,9 +308,7 @@ export interface Token2022Config {
  * - `free`: No additional fees charged
  */
 export type PriceModel =
-    | { amount: number; token: string; type: 'fixed' }
-    | { margin: number; type: 'margin' }
-    | { type: 'free' };
+    { amount: number; token: string; type: 'fixed' } | { margin: number; type: 'margin' } | { type: 'free' };
 
 export type PriceConfig = PriceModel;
 
@@ -459,6 +468,10 @@ export interface FeePayerPolicy {
 export interface RpcError {
     /** Error code */
     code: number;
+    /** Optional structured data about the error */
+    data?: {
+        error_type: string;
+    };
     /** Human-readable error message */
     message: string;
 }
@@ -651,8 +664,8 @@ export interface KitSignAndSendBundleResponse {
 
 /** Plugin validation config with Kit Address types */
 export interface KitValidationConfig {
-    /** List of allowed Solana program IDs */
-    allowed_programs: Address[];
+    /** List of allowed Solana program IDs, or "All" to allow any program. */
+    allowed_programs: 'All' | Address[];
     /** List of SPL tokens accepted for paid transactions */
     allowed_spl_paid_tokens: Address[];
     /** List of allowed token mint addresses for fee payment */

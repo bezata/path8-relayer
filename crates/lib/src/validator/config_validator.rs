@@ -2,7 +2,9 @@ use std::{collections::HashSet, path::Path, str::FromStr};
 
 use crate::{
     admin::token_util::find_missing_atas,
-    config::{FeePayerPolicy, SplTokenConfig, Token2022Config, TransferHookPolicy},
+    config::{
+        FeePayerPolicy, SplTokenConfig, Token2022Config, TransferHookPolicy, ValidationConfig,
+    },
     constant::{
         BPF_LOADER_UPGRADEABLE_PROGRAM_ID, LIGHTHOUSE_PROGRAM_ID, LOADER_V4_PROGRAM_ID,
         MAX_RECAPTCHA_SCORE, MIN_RECAPTCHA_SCORE, STAKE_PROGRAM_ID, VOTE_PROGRAM_ID,
@@ -32,6 +34,14 @@ use spl_token_interface::ID as SPL_TOKEN_PROGRAM_ID;
 
 const MIN_SIGN_TIMEOUT_SECONDS: u64 = 1;
 const HIGH_SIGN_MAX_RETRIES_WARNING_THRESHOLD: u32 = 10;
+const CROSS_CLUSTER_TIMEOUT_SECS: u64 = 5;
+
+enum ProbeOutcome {
+    Found(Vec<String>),
+    NotFound,
+    /// RPC error or timeout cannot conclude the mint is absent on this cluster.
+    Failed,
+}
 
 pub struct ConfigValidator {}
 
@@ -88,6 +98,129 @@ impl ConfigValidator {
                     token_str
                 ));
             }
+        }
+    }
+
+    pub async fn check_cross_cluster_mints(
+        rpc_client: &RpcClient,
+        tokens: &[String],
+        endpoints: &[String],
+        warnings: &mut Vec<String>,
+    ) {
+        let pubkeys: Vec<(String, Pubkey)> = tokens
+            .iter()
+            .filter_map(|t| Pubkey::from_str(t).ok().map(|pk| (t.clone(), pk)))
+            .collect();
+
+        if pubkeys.is_empty() {
+            return;
+        }
+
+        let pks: Vec<Pubkey> = pubkeys.iter().map(|(_, pk)| *pk).collect();
+        let accounts = match rpc_client.get_multiple_accounts(&pks).await {
+            Ok(a) => a,
+            Err(_) => {
+                warnings.push(
+                    "cross-cluster check skipped (could not reach connected cluster)".to_string(),
+                );
+                return;
+            }
+        };
+
+        let missing: Vec<String> = pubkeys
+            .iter()
+            .zip(accounts.iter())
+            .filter_map(|((addr, _), acct)| acct.is_none().then_some(addr.clone()))
+            .collect();
+
+        if missing.is_empty() {
+            return;
+        }
+
+        let probe_futures: Vec<_> = endpoints
+            .iter()
+            .map(|rpc_url| {
+                let missing = missing.clone();
+                let url = rpc_url.clone();
+                async move {
+                    let client = RpcClient::new(url.clone());
+                    let missing_pks: Vec<Pubkey> =
+                        missing.iter().filter_map(|addr| Pubkey::from_str(addr).ok()).collect();
+
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(CROSS_CLUSTER_TIMEOUT_SECS),
+                        client.get_multiple_accounts(&missing_pks),
+                    )
+                    .await;
+
+                    match result {
+                        Ok(Ok(accounts)) => {
+                            let found: Vec<String> = missing
+                                .iter()
+                                .zip(accounts.iter())
+                                .filter_map(|(addr, acct)| acct.is_some().then_some(addr.clone()))
+                                .collect();
+                            if found.is_empty() {
+                                (url, ProbeOutcome::NotFound)
+                            } else {
+                                (url, ProbeOutcome::Found(found))
+                            }
+                        }
+                        Ok(Err(_)) => (url, ProbeOutcome::Failed),
+                        Err(_) => (url, ProbeOutcome::Failed),
+                    }
+                }
+            })
+            .collect();
+
+        let probe_results = futures::future::join_all(probe_futures).await;
+        Self::emit_cluster_warnings(&missing, &probe_results, warnings);
+    }
+
+    fn emit_cluster_warnings(
+        missing: &[String],
+        probe_results: &[(String, ProbeOutcome)],
+        warnings: &mut Vec<String>,
+    ) {
+        for mint_addr in missing {
+            let found_on: Vec<&str> = probe_results
+                .iter()
+                .filter_map(|(cluster_name, outcome)| match outcome {
+                    ProbeOutcome::Found(mints) if mints.contains(mint_addr) => {
+                        Some(cluster_name.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            let conclusive: Vec<&str> = probe_results
+                .iter()
+                .filter_map(|(name, outcome)| match outcome {
+                    ProbeOutcome::Found(_) | ProbeOutcome::NotFound => Some(name.as_str()),
+                    ProbeOutcome::Failed => None,
+                })
+                .collect();
+
+            let warning = if !found_on.is_empty() {
+                format!(
+                    "mint {} not found on the connected cluster\n  found on: {}\n  possible cluster mismatch",
+                    mint_addr,
+                    found_on.join(", ")
+                )
+            } else if conclusive.is_empty() {
+                format!(
+                    "mint {} not found on the connected cluster\n  cross-cluster check inconclusive (all probes failed or timed out)",
+                    mint_addr,
+                )
+            } else {
+                format!(
+                    "mint {} not found on the connected cluster or on: {}",
+                    mint_addr,
+                    conclusive.join(", ")
+                )
+            };
+
+            warnings.push(warning);
         }
     }
 
@@ -353,6 +486,24 @@ impl ConfigValidator {
         }
     }
 
+    fn warn_mutable_transfer_hook_payment_risk(
+        validation: &ValidationConfig,
+        warnings: &mut Vec<String>,
+    ) {
+        let allows_immediate_mutable_hook =
+            !matches!(validation.token_2022.transfer_hook_policy, TransferHookPolicy::DenyAll);
+        if allows_immediate_mutable_hook && validation.is_payment_required() {
+            warnings.push(
+                "⚠️  SECURITY: transfer_hook_policy allows mutable Token-2022 transfer hooks on \
+                immediate signAndSend. A payment mint with a mutable transfer hook can refund \
+                Kora's payment after validation but before execution, leaving zero net payment. \
+                Use transfer_hook_policy = \"deny_all\", or only accept payment mints with \
+                immutable transfer hooks."
+                    .to_string(),
+            );
+        }
+    }
+
     pub async fn validate(_rpc_client: &RpcClient) -> Result<(), KoraError> {
         let config = &get_config()?;
 
@@ -486,8 +637,16 @@ impl ConfigValidator {
             );
         }
 
-        // Validate allowed programs (warn if empty or missing system/token programs)
-        if config.validation.allowed_programs.is_empty() {
+        // Validate allowed programs (warn if empty, wildcard, or missing system/token programs).
+        let is_wildcard = config.validation.allowed_programs.is_all();
+        if is_wildcard {
+            warnings.push(
+                "allowed_programs is set to \"All\" — WILDCARD MODE: any program will be \
+                 accepted. Ensure upstream policy enforcement and fee_payer_policy / \
+                 disallowed_accounts are configured to bound drainage risk."
+                    .to_string(),
+            );
+        } else if config.validation.allowed_programs.as_slice().is_empty() {
             warnings.push(
                 "No allowed programs configured - this will block all transactions".to_string(),
             );
@@ -502,12 +661,17 @@ impl ConfigValidator {
             }
         }
 
-        Self::warn_unvalidated_programs(&config.validation.allowed_programs, &mut warnings);
+        if !is_wildcard {
+            Self::warn_unvalidated_programs(
+                config.validation.allowed_programs.as_slice(),
+                &mut warnings,
+            );
+        }
 
         // Validate lighthouse configuration
         if config.kora.lighthouse.enabled {
             let lighthouse_program = LIGHTHOUSE_PROGRAM_ID.to_string();
-            if !config.validation.allowed_programs.contains(&lighthouse_program) {
+            if !is_wildcard && !config.validation.allowed_programs.contains(&lighthouse_program) {
                 errors.push(format!(
                     "Lighthouse is enabled but {} is not in allowed_programs. Consider adding it to allowed_programs.",
                     LIGHTHOUSE_PROGRAM_ID
@@ -675,6 +839,8 @@ impl ConfigValidator {
         // Validate fee payer policy - warn about enabled risky operations
         Self::validate_fee_payer_policy(&config.validation.fee_payer_policy, &mut warnings);
 
+        Self::warn_mutable_transfer_hook_payment_risk(&config.validation, &mut warnings);
+
         // Validate margin (error if negative)
         match &config.validation.price.model {
             PriceModel::Fixed { amount, token, strict } => {
@@ -692,8 +858,7 @@ impl ConfigValidator {
                 }
 
                 // Warn about dangerous configurations with fixed pricing
-                let has_auth =
-                    config.kora.auth.api_key.is_some() || config.kora.auth.hmac_secret.is_some();
+                let has_auth = config.kora.auth.has_resolved_auth();
                 if !has_auth {
                     warnings.push(
                         "⚠️  SECURITY: Fixed pricing with NO authentication enabled. \
@@ -723,7 +888,7 @@ impl ConfigValidator {
         };
 
         // General authentication warning
-        let has_auth = config.kora.auth.api_key.is_some() || config.kora.auth.hmac_secret.is_some();
+        let has_auth = config.kora.auth.has_resolved_auth();
         if !has_auth {
             warnings.push(
                 "⚠️  SECURITY: No authentication configured (neither api_key nor hmac_secret). \
@@ -733,9 +898,27 @@ impl ConfigValidator {
             );
         }
 
+        // The running server resolves auth env-first, so a stale KORA_* environment variable
+        // silently overrides a rotated kora.toml secret and keeps the retired credential valid.
+        for (env_var, field) in config.kora.auth.env_overridden_fields() {
+            warnings.push(format!(
+                "⚠️  SECURITY: environment variable {env_var} overrides {field}. The environment \
+                 value takes precedence at runtime; if you rotated the secret in kora.toml, the \
+                 stale environment value is still in effect. Unset {env_var} or align it with the config."
+            ));
+        }
+
         // Validate usage limit configuration
         let usage_config = &config.kora.usage_limit;
         if usage_config.enabled {
+            if usage_config.rules.is_empty() {
+                errors.push(
+                    "usage_limit.enabled is true but no rules are configured; add at least one \
+                     [[kora.usage_limit.rules]] or set enabled = false"
+                        .to_string(),
+                );
+            }
+
             let (usage_errors, usage_warnings) = CacheValidator::validate(usage_config).await;
             errors.extend(usage_errors);
             warnings.extend(usage_warnings);
@@ -816,6 +999,25 @@ impl ConfigValidator {
                     errors.push(format!("Invalid payment address: {payment_address}"));
                 }
             }
+        }
+
+        if config.validation.cross_cluster_check {
+            let mut all_tokens: Vec<String> = config
+                .validation
+                .allowed_tokens
+                .iter()
+                .chain(config.validation.allowed_spl_paid_tokens.iter())
+                .cloned()
+                .collect();
+            all_tokens.sort_unstable();
+            all_tokens.dedup();
+            Self::check_cross_cluster_mints(
+                rpc_client,
+                &all_tokens,
+                &config.validation.cross_cluster_endpoints,
+                &mut warnings,
+            )
+            .await;
         }
 
         // Validate signers configuration if provided
@@ -919,7 +1121,7 @@ mod tests {
         config::{
             AuthConfig, BundleConfig, CacheConfig, Config, EnabledMethods, FeePayerPolicy,
             KoraConfig, LighthouseConfig, MetricsConfig, NonceInstructionPolicy, PluginsConfig,
-            SplTokenConfig, SplTokenInstructionPolicy, SystemInstructionPolicy,
+            ProgramsConfig, SplTokenConfig, SplTokenInstructionPolicy, SystemInstructionPolicy,
             Token2022InstructionPolicy, TransactionPluginType, TransferHookPolicy,
             UsageLimitConfig, ValidationConfig,
         },
@@ -949,7 +1151,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1000000000,
                 max_signatures: 10,
-                allowed_programs: vec!["program1".to_string()],
+                allowed_programs: ProgramsConfig::Allowlist(vec!["program1".to_string()]),
                 allowed_tokens: vec!["token1".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec!["token3".to_string()]),
                 disallowed_accounts: vec!["account1".to_string()],
@@ -960,6 +1162,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig::default(),
             path8: Default::default(),
@@ -990,10 +1194,10 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![
+                allowed_programs: ProgramsConfig::Allowlist(vec![
                     SYSTEM_PROGRAM_ID.to_string(),
                     SPL_TOKEN_PROGRAM_ID.to_string(),
-                ],
+                ]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -1006,6 +1210,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig::default(),
             path8: Default::default(),
@@ -1028,20 +1234,109 @@ mod tests {
         assert!(warnings.iter().any(|w| w.contains("No authentication configured")));
     }
 
+    fn validation_config_with_auth() -> ValidationConfig {
+        ValidationConfig {
+            max_allowed_lamports: 1_000_000,
+            max_signatures: 10,
+            allowed_programs: ProgramsConfig::Allowlist(vec![
+                SYSTEM_PROGRAM_ID.to_string(),
+                SPL_TOKEN_PROGRAM_ID.to_string(),
+            ]),
+            allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
+            allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
+                "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
+            ]),
+            disallowed_accounts: vec![],
+            price_source: PriceSource::Jupiter,
+            fee_payer_policy: FeePayerPolicy::default(),
+            price: PriceConfig::default(),
+            token_2022: Token2022Config::default(),
+            allow_durable_transactions: false,
+            max_price_staleness_slots: 0,
+            require_one_of_programs: vec![],
+            cross_cluster_check: false,
+            cross_cluster_endpoints: vec![],
+        }
+    }
+
     #[tokio::test]
     #[serial]
-    async fn test_validate_with_result_warns_for_unblocked_permanent_delegate_when_token2022_enabled(
-    ) {
+    async fn test_validate_warns_when_env_overrides_config_auth_secret() {
+        std::env::set_var("JUPITER_API_KEY", "test-api-key");
+        std::env::set_var(AuthConfig::API_KEY_ENV, "stale-env-key");
+        let config = Config {
+            validation: validation_config_with_auth(),
+            kora: KoraConfig {
+                auth: AuthConfig {
+                    api_key: Some("rotated-config-key".to_string()),
+                    ..Default::default()
+                },
+                ..KoraConfig::default()
+            },
+            path8: Default::default(),
+            metrics: MetricsConfig::default(),
+        };
+        let _ = update_config(config);
+
+        let rpc_client = RpcClient::new_with_commitment(
+            "http://localhost:8899".to_string(),
+            CommitmentConfig::confirmed(),
+        );
+        let result = ConfigValidator::validate_with_result(&rpc_client, true).await;
+        std::env::remove_var(AuthConfig::API_KEY_ENV);
+        std::env::remove_var("JUPITER_API_KEY");
+
+        let warnings = result.expect("validation should succeed with warnings");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("KORA_API_KEY") && w.contains("[kora.auth].api_key")),
+            "expected an env-override warning naming the field, got: {warnings:?}"
+        );
+        // Auth is in effect, so the no-auth warning must not appear.
+        assert!(!warnings.iter().any(|w| w.contains("No authentication configured")));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_validate_no_false_no_auth_warning_when_env_provides_auth() {
+        std::env::set_var("JUPITER_API_KEY", "test-api-key");
+        std::env::set_var(AuthConfig::API_KEY_ENV, "env-only-key");
+        let config = Config {
+            validation: validation_config_with_auth(),
+            kora: KoraConfig::default(),
+            path8: Default::default(),
+            metrics: MetricsConfig::default(),
+        };
+        let _ = update_config(config);
+
+        let rpc_client = RpcClient::new_with_commitment(
+            "http://localhost:8899".to_string(),
+            CommitmentConfig::confirmed(),
+        );
+        let result = ConfigValidator::validate_with_result(&rpc_client, true).await;
+        std::env::remove_var(AuthConfig::API_KEY_ENV);
+        std::env::remove_var("JUPITER_API_KEY");
+
+        let warnings = result.expect("validation should succeed");
+        assert!(
+            !warnings.iter().any(|w| w.contains("No authentication configured")),
+            "env-provided auth must suppress the no-auth warning, got: {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_validate_rejects_usage_limit_enabled_without_rules() {
         std::env::set_var("JUPITER_API_KEY", "test-api-key");
         let config = Config {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![
+                allowed_programs: ProgramsConfig::Allowlist(vec![
                     SYSTEM_PROGRAM_ID.to_string(),
                     SPL_TOKEN_PROGRAM_ID.to_string(),
-                    TOKEN_2022_PROGRAM_ID.to_string(),
-                ],
+                ]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -1054,6 +1349,112 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
+            },
+            kora: KoraConfig {
+                usage_limit: UsageLimitConfig {
+                    enabled: true,
+                    cache_url: None,
+                    fallback_if_unavailable: true,
+                    rules: vec![],
+                },
+                ..KoraConfig::default()
+            },
+            path8: Default::default(),
+            metrics: MetricsConfig::default(),
+        };
+
+        let _ = update_config(config);
+
+        let rpc_client = RpcClient::new_with_commitment(
+            "http://localhost:8899".to_string(),
+            CommitmentConfig::confirmed(),
+        );
+        let result = ConfigValidator::validate_with_result(&rpc_client, true).await;
+        let errors = result.expect_err("enabled usage_limit with no rules must fail validation");
+        assert!(errors.iter().any(|e| e.contains("no rules are configured")));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_validate_allows_usage_limit_disabled_without_rules() {
+        std::env::set_var("JUPITER_API_KEY", "test-api-key");
+        let config = Config {
+            validation: ValidationConfig {
+                max_allowed_lamports: 1_000_000,
+                max_signatures: 10,
+                allowed_programs: ProgramsConfig::Allowlist(vec![
+                    SYSTEM_PROGRAM_ID.to_string(),
+                    SPL_TOKEN_PROGRAM_ID.to_string(),
+                ]),
+                allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
+                allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
+                    "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
+                ]),
+                disallowed_accounts: vec![],
+                price_source: PriceSource::Jupiter,
+                fee_payer_policy: FeePayerPolicy::default(),
+                price: PriceConfig::default(),
+                token_2022: Token2022Config::default(),
+                allow_durable_transactions: false,
+                max_price_staleness_slots: 0,
+                require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
+            },
+            kora: KoraConfig {
+                usage_limit: UsageLimitConfig {
+                    enabled: false,
+                    cache_url: None,
+                    fallback_if_unavailable: true,
+                    rules: vec![],
+                },
+                ..KoraConfig::default()
+            },
+            path8: Default::default(),
+            metrics: MetricsConfig::default(),
+        };
+
+        let _ = update_config(config);
+
+        let rpc_client = RpcClient::new_with_commitment(
+            "http://localhost:8899".to_string(),
+            CommitmentConfig::confirmed(),
+        );
+        let result = ConfigValidator::validate_with_result(&rpc_client, true).await;
+        let warnings = result.expect("disabled usage_limit with no rules must pass validation");
+        assert!(!warnings.iter().any(|w| w.contains("no rules are configured")));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_validate_with_result_warns_for_unblocked_permanent_delegate_when_token2022_enabled(
+    ) {
+        std::env::set_var("JUPITER_API_KEY", "test-api-key");
+        let config = Config {
+            validation: ValidationConfig {
+                max_allowed_lamports: 1_000_000,
+                max_signatures: 10,
+                allowed_programs: ProgramsConfig::Allowlist(vec![
+                    SYSTEM_PROGRAM_ID.to_string(),
+                    SPL_TOKEN_PROGRAM_ID.to_string(),
+                    TOKEN_2022_PROGRAM_ID.to_string(),
+                ]),
+                allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
+                allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
+                    "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
+                ]),
+                disallowed_accounts: vec![],
+                price_source: PriceSource::Jupiter,
+                fee_payer_policy: FeePayerPolicy::default(),
+                price: PriceConfig::default(),
+                token_2022: Token2022Config::default(),
+                allow_durable_transactions: false,
+                max_price_staleness_slots: 0,
+                require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig::default(),
             path8: Default::default(),
@@ -1081,11 +1482,11 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![
+                allowed_programs: ProgramsConfig::Allowlist(vec![
                     SYSTEM_PROGRAM_ID.to_string(),
                     SPL_TOKEN_PROGRAM_ID.to_string(),
                     TOKEN_2022_PROGRAM_ID.to_string(),
-                ],
+                ]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -1102,6 +1503,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig::default(),
             path8: Default::default(),
@@ -1126,9 +1529,9 @@ mod tests {
     async fn test_validate_with_result_warnings() {
         let config = Config {
             validation: ValidationConfig {
-                max_allowed_lamports: 0,  // Should warn
-                max_signatures: 0,        // Should warn
-                allowed_programs: vec![], // Should warn
+                max_allowed_lamports: 0,                             // Should warn
+                max_signatures: 0,                                   // Should warn
+                allowed_programs: ProgramsConfig::Allowlist(vec![]), // Should warn
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![]),
                 disallowed_accounts: vec![],
@@ -1139,6 +1542,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig {
                 rate_limit: 0, // Should warn
@@ -1218,7 +1623,8 @@ mod tests {
         let mut config = ConfigMockBuilder::new().build();
         config.kora.cache.enabled = false;
         config.kora.plugins.enabled = vec![TransactionPluginType::GasSwap];
-        config.validation.allowed_programs = vec![SPL_TOKEN_PROGRAM_ID.to_string()]; // no system program
+        config.validation.allowed_programs =
+            ProgramsConfig::Allowlist(vec![SPL_TOKEN_PROGRAM_ID.to_string()]); // no system program
 
         let _ = update_config(config);
 
@@ -1237,7 +1643,8 @@ mod tests {
         let mut config = ConfigMockBuilder::new().build();
         config.kora.cache.enabled = false;
         config.kora.plugins.enabled = vec![TransactionPluginType::GasSwap];
-        config.validation.allowed_programs = vec![SYSTEM_PROGRAM_ID.to_string()]; // no token program
+        config.validation.allowed_programs =
+            ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]); // no token program
 
         let _ = update_config(config);
 
@@ -1298,7 +1705,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![SYSTEM_PROGRAM_ID.to_string()],
+                allowed_programs: ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]),
                 allowed_tokens: vec![],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![]),
                 disallowed_accounts: vec![],
@@ -1309,6 +1716,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig::default(),
             path8: Default::default(),
@@ -1336,7 +1745,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![SYSTEM_PROGRAM_ID.to_string()],
+                allowed_programs: ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]),
                 allowed_tokens: vec![],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -1349,6 +1758,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig::default(),
             path8: Default::default(),
@@ -1375,7 +1786,9 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec!["11111111111111111111111111111112".to_string()], // Missing system program, but valid base58
+                allowed_programs: ProgramsConfig::Allowlist(vec![
+                    "11111111111111111111111111111112".to_string(),
+                ]), // Missing system program, but valid base58
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![]),
                 disallowed_accounts: vec![],
@@ -1386,6 +1799,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig::default(),
             path8: Default::default(),
@@ -1453,11 +1868,11 @@ mod tests {
         let mut config = ConfigMockBuilder::new().build();
         config.kora.cache.enabled = false;
         let compute_budget_program = solana_compute_budget_interface::id().to_string();
-        config.validation.allowed_programs = vec![
+        config.validation.allowed_programs = ProgramsConfig::Allowlist(vec![
             SYSTEM_PROGRAM_ID.to_string(),
             SPL_TOKEN_PROGRAM_ID.to_string(),
             compute_budget_program.clone(),
-        ];
+        ]);
         config.validation.require_one_of_programs = vec![compute_budget_program];
 
         let _ = update_config(config);
@@ -1488,7 +1903,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![SYSTEM_PROGRAM_ID.to_string()],
+                allowed_programs: ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]),
                 allowed_tokens: vec![], // Error - no tokens
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "invalid_token_address".to_string()
@@ -1503,6 +1918,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -1532,7 +1949,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![SYSTEM_PROGRAM_ID.to_string()],
+                allowed_programs: ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -1551,6 +1968,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -1577,7 +1996,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![SYSTEM_PROGRAM_ID.to_string()],
+                allowed_programs: ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -1596,6 +2015,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -1628,10 +2049,10 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![
+                allowed_programs: ProgramsConfig::Allowlist(vec![
                     SYSTEM_PROGRAM_ID.to_string(),
                     SPL_TOKEN_PROGRAM_ID.to_string(),
-                ],
+                ]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -1650,6 +2071,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -1678,7 +2101,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![SYSTEM_PROGRAM_ID.to_string()], // Missing token programs
+                allowed_programs: ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]), // Missing token programs
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![]), // Empty when fees enabled - should error
                 disallowed_accounts: vec![],
@@ -1689,6 +2112,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -1719,10 +2144,10 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![
+                allowed_programs: ProgramsConfig::Allowlist(vec![
                     SYSTEM_PROGRAM_ID.to_string(),
                     SPL_TOKEN_PROGRAM_ID.to_string(),
-                ],
+                ]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::All, // All tokens are allowed
                 disallowed_accounts: vec![],
@@ -1733,6 +2158,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -1759,10 +2186,10 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![
+                allowed_programs: ProgramsConfig::Allowlist(vec![
                     SYSTEM_PROGRAM_ID.to_string(),
                     SPL_TOKEN_PROGRAM_ID.to_string(),
-                ],
+                ]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(), // Not in allowed_tokens
@@ -1775,6 +2202,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -1797,7 +2226,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![SYSTEM_PROGRAM_ID.to_string()],
+                allowed_programs: ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()], // Required to pass basic validation
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -1810,6 +2239,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -1823,7 +2254,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![], // No programs
+                allowed_programs: ProgramsConfig::Allowlist(vec![]), // No programs
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![]), // Empty to avoid duplicate validation
                 disallowed_accounts: vec![],
@@ -1834,6 +2265,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -1890,7 +2323,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![SYSTEM_PROGRAM_ID.to_string()],
+                allowed_programs: ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![]),
                 disallowed_accounts: vec![],
@@ -1901,6 +2334,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -1926,7 +2361,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![SYSTEM_PROGRAM_ID.to_string()],
+                allowed_programs: ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![]),
                 disallowed_accounts: vec![],
@@ -1937,6 +2372,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -1962,7 +2399,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![SYSTEM_PROGRAM_ID.to_string()],
+                allowed_programs: ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![]),
                 disallowed_accounts: vec![],
@@ -1973,6 +2410,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -1997,7 +2436,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![SYSTEM_PROGRAM_ID.to_string()],
+                allowed_programs: ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![]),
                 disallowed_accounts: vec![],
@@ -2015,6 +2454,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -2038,7 +2479,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![SYSTEM_PROGRAM_ID.to_string()],
+                allowed_programs: ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![]),
                 disallowed_accounts: vec![],
@@ -2053,6 +2494,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -2079,7 +2522,7 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![SYSTEM_PROGRAM_ID.to_string()],
+                allowed_programs: ProgramsConfig::Allowlist(vec![SYSTEM_PROGRAM_ID.to_string()]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![]),
                 disallowed_accounts: vec![],
@@ -2095,6 +2538,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -2194,11 +2639,11 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![
+                allowed_programs: ProgramsConfig::Allowlist(vec![
                     SYSTEM_PROGRAM_ID.to_string(),
                     SPL_TOKEN_PROGRAM_ID.to_string(),
                     TOKEN_2022_PROGRAM_ID.to_string(),
-                ],
+                ]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -2231,6 +2676,8 @@ mod tests {
                         allow_initialize_multisig: true,
                         allow_freeze_account: true,
                         allow_thaw_account: true,
+                        allow_withdraw_excess_lamports: true,
+                        allow_unwrap_lamports: true,
                     },
                     token_2022: Token2022InstructionPolicy {
                         allow_transfer: true,
@@ -2247,6 +2694,8 @@ mod tests {
                         allow_update_extension_authority: true,
                         allow_freeze_account: true,
                         allow_thaw_account: true,
+                        allow_withdraw_excess_lamports: true,
+                        allow_unwrap_lamports: true,
                     },
                     alt: crate::config::AltInstructionPolicy {
                         allow_create: true,
@@ -2282,6 +2731,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             path8: Default::default(),
             metrics: MetricsConfig::default(),
@@ -2585,10 +3036,10 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![
+                allowed_programs: ProgramsConfig::Allowlist(vec![
                     SYSTEM_PROGRAM_ID.to_string(),
                     SPL_TOKEN_PROGRAM_ID.to_string(),
-                ],
+                ]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -2601,6 +3052,8 @@ mod tests {
                 allow_durable_transactions: true, // Enabled - should warn
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig::default(),
             path8: Default::default(),
@@ -2626,10 +3079,10 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![
+                allowed_programs: ProgramsConfig::Allowlist(vec![
                     SYSTEM_PROGRAM_ID.to_string(),
                     SPL_TOKEN_PROGRAM_ID.to_string(),
-                ],
+                ]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -2642,6 +3095,8 @@ mod tests {
                 allow_durable_transactions: false, // Disabled - should not warn
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig::default(),
             path8: Default::default(),
@@ -2668,10 +3123,10 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![
+                allowed_programs: ProgramsConfig::Allowlist(vec![
                     SYSTEM_PROGRAM_ID.to_string(),
                     SPL_TOKEN_PROGRAM_ID.to_string(),
-                ],
+                ]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -2684,6 +3139,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig::default(),
             path8: Default::default(),
@@ -2709,10 +3166,10 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![
+                allowed_programs: ProgramsConfig::Allowlist(vec![
                     SYSTEM_PROGRAM_ID.to_string(),
                     SPL_TOKEN_PROGRAM_ID.to_string(),
-                ], // Lighthouse program NOT included
+                ]), // Lighthouse program NOT included
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -2725,6 +3182,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig {
                 lighthouse: LighthouseConfig {
@@ -2757,11 +3216,11 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![
+                allowed_programs: ProgramsConfig::Allowlist(vec![
                     SYSTEM_PROGRAM_ID.to_string(),
                     SPL_TOKEN_PROGRAM_ID.to_string(),
                     LIGHTHOUSE_PROGRAM_ID.to_string(), // Lighthouse in allowed
-                ],
+                ]),
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -2774,6 +3233,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig {
                 lighthouse: LighthouseConfig {
@@ -2807,10 +3268,10 @@ mod tests {
             validation: ValidationConfig {
                 max_allowed_lamports: 1_000_000,
                 max_signatures: 10,
-                allowed_programs: vec![
+                allowed_programs: ProgramsConfig::Allowlist(vec![
                     SYSTEM_PROGRAM_ID.to_string(),
                     SPL_TOKEN_PROGRAM_ID.to_string(),
-                ], // Lighthouse NOT included - but should be OK since disabled
+                ]), // Lighthouse NOT included - but should be OK since disabled
                 allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
                 allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
                     "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
@@ -2823,6 +3284,8 @@ mod tests {
                 allow_durable_transactions: false,
                 max_price_staleness_slots: 0,
                 require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
             },
             kora: KoraConfig {
                 lighthouse: LighthouseConfig {
@@ -2884,6 +3347,39 @@ mod tests {
     }
 
     #[test]
+    fn test_warn_mutable_transfer_hook_payment_risk() {
+        use crate::{fee::price::PriceModel, tests::config_mock::ConfigMockBuilder};
+
+        let build = |policy: TransferHookPolicy, model: PriceModel| {
+            let mut config = ConfigMockBuilder::new().build();
+            config.validation.token_2022.transfer_hook_policy = policy;
+            config.validation.price.model = model;
+            config
+        };
+
+        // Paid pricing + policy that allows immediate-send mutable hooks -> warning.
+        let config = build(
+            TransferHookPolicy::DenyMutableForDelayedSigning,
+            PriceModel::Margin { margin: 0.0 },
+        );
+        let mut warnings = Vec::new();
+        ConfigValidator::warn_mutable_transfer_hook_payment_risk(&config.validation, &mut warnings);
+        assert!(warnings.iter().any(|w| w.contains("mutable Token-2022 transfer hooks")));
+
+        // DenyAll -> no warning.
+        let config = build(TransferHookPolicy::DenyAll, PriceModel::Margin { margin: 0.0 });
+        let mut warnings = Vec::new();
+        ConfigValidator::warn_mutable_transfer_hook_payment_risk(&config.validation, &mut warnings);
+        assert!(warnings.is_empty());
+
+        // Free pricing -> no warning even if the policy would allow mutable hooks.
+        let config = build(TransferHookPolicy::AllowAll, PriceModel::Free);
+        let mut warnings = Vec::new();
+        ConfigValidator::warn_mutable_transfer_hook_payment_risk(&config.validation, &mut warnings);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
     fn test_warn_unvalidated_programs_warns_for_vote_program() {
         use crate::constant::VOTE_PROGRAM_ID;
         let allowed = vec![SYSTEM_PROGRAM_ID.to_string(), VOTE_PROGRAM_ID.to_string()];
@@ -2942,5 +3438,158 @@ mod tests {
         assert_eq!(warnings.len(), 2);
         assert!(warnings.iter().any(|w| w.contains("Vote Program")));
         assert!(warnings.iter().any(|w| w.contains(&custom)));
+    }
+
+    #[test]
+    fn test_missing_mint_triggers_warning() {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string();
+        let probe_results: Vec<(String, ProbeOutcome)> = vec![
+            ("devnet".into(), ProbeOutcome::NotFound),
+            ("testnet".into(), ProbeOutcome::Failed),
+        ];
+        let mut warnings = Vec::new();
+        ConfigValidator::emit_cluster_warnings(std::slice::from_ref(&mint), &probe_results, &mut warnings);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains(&mint)
+                && warnings[0].contains("not found on the connected cluster or on:"),
+            "unexpected warning: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn test_all_probes_failed() {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string();
+        let probe_results: Vec<(String, ProbeOutcome)> =
+            vec![("devnet".into(), ProbeOutcome::Failed), ("testnet".into(), ProbeOutcome::Failed)];
+        let mut warnings = Vec::new();
+        ConfigValidator::emit_cluster_warnings(std::slice::from_ref(&mint), &probe_results, &mut warnings);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains(&mint) && warnings[0].contains("cross-cluster check inconclusive"),
+            "unexpected warning: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn test_existing_mint_no_warning() {
+        let probe_results: Vec<(String, ProbeOutcome)> = vec![];
+        let mut warnings = Vec::new();
+        ConfigValidator::emit_cluster_warnings(&[], &probe_results, &mut warnings);
+
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_mint_found_on_other_cluster_warning() {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string();
+        let probe_results: Vec<(String, ProbeOutcome)> = vec![
+            ("devnet".into(), ProbeOutcome::Found(vec![mint.clone()])),
+            ("testnet".into(), ProbeOutcome::NotFound),
+        ];
+        let mut warnings = Vec::new();
+        ConfigValidator::emit_cluster_warnings(std::slice::from_ref(&mint), &probe_results, &mut warnings);
+
+        assert_eq!(warnings.len(), 1);
+        let w = &warnings[0];
+        assert!(w.contains(&mint), "mint address missing from warning");
+        assert!(w.contains("found on:"), "expected 'found on:' in warning");
+        assert!(w.contains("devnet"), "expected cluster name in warning");
+        assert!(w.contains("possible cluster mismatch"), "expected mismatch note");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_validate_signers_http_config() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        std::env::set_var("JUPITER_API_KEY", "test-api-key");
+        let config = Config {
+            validation: ValidationConfig {
+                max_allowed_lamports: 1_000_000,
+                max_signatures: 10,
+                allowed_programs: ProgramsConfig::Allowlist(vec![
+                    SYSTEM_PROGRAM_ID.to_string(),
+                    SPL_TOKEN_PROGRAM_ID.to_string(),
+                ]),
+                allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
+                allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
+                    "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
+                ]),
+                disallowed_accounts: vec![],
+                price_source: PriceSource::Jupiter,
+                fee_payer_policy: FeePayerPolicy::default(),
+                price: PriceConfig::default(),
+                token_2022: Token2022Config::default(),
+                allow_durable_transactions: false,
+                max_price_staleness_slots: 0,
+                require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
+            },
+            kora: KoraConfig::default(),
+            path8: Default::default(),
+            metrics: MetricsConfig::default(),
+        };
+
+        let _ = update_config(config);
+
+        let toml_content = r#"
+[signer_pool]
+strategy = "round_robin"
+
+[[signers]]
+name = "turnkey_signer_invalid"
+type = "turnkey"
+api_public_key_env = "TURNKEY_API_PUBLIC_KEY"
+api_private_key_env = "TURNKEY_API_PRIVATE_KEY"
+organization_id_env = "TURNKEY_ORG_ID"
+private_key_id_env = "TURNKEY_PRIVATE_KEY_ID"
+public_key_env = "TURNKEY_PUBLIC_KEY"
+http_config = { request_timeout_secs = 0, connect_timeout_secs = 0 }
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(toml_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        std::env::set_var("TURNKEY_API_PUBLIC_KEY", "dummy");
+        std::env::set_var("TURNKEY_API_PRIVATE_KEY", "dummy");
+        std::env::set_var("TURNKEY_ORG_ID", "dummy");
+        std::env::set_var("TURNKEY_PRIVATE_KEY_ID", "dummy");
+        std::env::set_var("TURNKEY_PUBLIC_KEY", "7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV");
+
+        let rpc_client = RpcClient::new_with_commitment(
+            "http://localhost:8899".to_string(),
+            CommitmentConfig::confirmed(),
+        );
+
+        let result = ConfigValidator::validate_with_result_and_signers(
+            &rpc_client,
+            true,
+            Some(temp_file.path()),
+        )
+        .await;
+
+        std::env::remove_var("TURNKEY_API_PUBLIC_KEY");
+        std::env::remove_var("TURNKEY_API_PRIVATE_KEY");
+        std::env::remove_var("TURNKEY_ORG_ID");
+        std::env::remove_var("TURNKEY_PRIVATE_KEY_ID");
+        std::env::remove_var("TURNKEY_PUBLIC_KEY");
+        std::env::remove_var("JUPITER_API_KEY");
+
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains(
+            "request_timeout_secs must be greater than 0 for signer 'turnkey_signer_invalid'"
+        )));
+        assert!(errors.iter().any(|e| e.contains(
+            "connect_timeout_secs must be greater than 0 for signer 'turnkey_signer_invalid'"
+        )));
     }
 }

@@ -1,4 +1,5 @@
 use crate::{
+    config::AuthConfig,
     constant::{X_API_KEY, X_HMAC_SIGNATURE, X_RECAPTCHA_TOKEN, X_TIMESTAMP},
     metrics::run_metrics_server_if_required,
     rpc_server::{
@@ -10,6 +11,8 @@ use crate::{
     },
     usage_limit::UsageTracker,
 };
+
+use crate::state::drain_background_tasks;
 
 #[cfg(not(test))]
 use crate::state::get_config;
@@ -32,9 +35,78 @@ pub struct ServerHandles {
     pub balance_tracker_handle: Option<JoinHandle<()>>,
 }
 
+/// How long to wait for the RPC server to finish in-flight requests before
+/// giving up and continuing shutdown.
+const RPC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long to wait for fire-and-forget broadcasts to reach an RPC node before
+/// giving up and letting the runtime exit.
+const BROADCAST_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl ServerHandles {
+    /// Gracefully shut down the RPC server and its background work.
+    ///
+    /// Order matters: stop the balance tracker, wait for the RPC server to
+    /// finish in-flight requests (so no new background broadcasts are spawned),
+    /// drain the broadcasts that were spawned, then stop the metrics server.
+    ///
+    /// `port` is the RPC port, needed to wake an idle accept loop (see
+    /// [`wait_for_rpc_stop`]).
+    pub async fn shutdown(self, port: u16) {
+        if let Some(handle) = self.balance_tracker_handle {
+            log::info!("Stopping balance tracker background task...");
+            handle.abort();
+        }
+
+        wait_for_rpc_stop(self.rpc_handle, port).await;
+
+        if !drain_background_tasks(BROADCAST_DRAIN_TIMEOUT).await {
+            log::warn!(
+                "Timed out after {}s waiting for background broadcasts to finish; \
+                 some transactions may not have been forwarded",
+                BROADCAST_DRAIN_TIMEOUT.as_secs()
+            );
+        }
+
+        if let Some(handle) = self.metrics_handle {
+            if let Err(e) = handle.stop() {
+                log::warn!("Error stopping metrics server: {e:?}");
+            }
+        }
+    }
+}
+
+/// Stop the RPC server and wait until it finishes handling in-flight requests.
+///
+/// This whole helper only exists to work around the jsonrpsee version we are
+/// pinned to (0.16): its accept loop re-checks the stop signal only when woken
+/// by a new connection, so on a server that has been idle since startup
+/// `stopped()` would block until the next request arrives. We open a throwaway
+/// connection to wake the loop immediately, and cap the wait so shutdown can
+/// never hang.
+///
+/// Newer jsonrpsee releases reworked graceful shutdown and `stopped()` returns
+/// on its own, so this function (the TcpStream wake and the timeout) can be
+/// dropped once we upgrade.
+async fn wait_for_rpc_stop(rpc_handle: ServerHandle, port: u16) {
+    if let Err(e) = rpc_handle.stop() {
+        log::warn!("RPC server was already stopping: {e:?}");
+        return;
+    }
+
+    let _ = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+
+    if tokio::time::timeout(RPC_STOP_TIMEOUT, rpc_handle.stopped()).await.is_err() {
+        log::warn!(
+            "RPC server did not finish stopping within {}s; continuing shutdown",
+            RPC_STOP_TIMEOUT.as_secs()
+        );
+    }
+}
+
 // We'll always prioritize the environment variable over the config value
 fn get_value_by_priority(env_var: &str, config_value: Option<String>) -> Option<String> {
-    std::env::var(env_var).ok().or(config_value)
+    AuthConfig::resolve_secret(env_var, config_value.as_deref())
 }
 
 pub async fn run_rpc_server(rpc: KoraRpc, port: u16) -> Result<ServerHandles, anyhow::Error> {
@@ -71,15 +143,13 @@ pub async fn run_rpc_server(rpc: KoraRpc, port: u16) -> Result<ServerHandles, an
     // Build whitelist of allowed methods from enabled_methods config
     let allowed_methods = config.kora.enabled_methods.get_enabled_method_names();
 
-    let recaptcha_config =
-        get_value_by_priority("KORA_RECAPTCHA_SECRET", config.kora.auth.recaptcha_secret.clone())
-            .map(|secret| {
-                RecaptchaConfig::new(
-                    secret,
-                    config.kora.auth.recaptcha_score_threshold,
-                    config.kora.auth.protected_methods.clone(),
-                )
-            });
+    let recaptcha_config = config.kora.auth.resolved_recaptcha_secret().map(|secret| {
+        RecaptchaConfig::new(
+            secret,
+            config.kora.auth.recaptcha_score_threshold,
+            config.kora.auth.protected_methods.clone(),
+        )
+    });
 
     let middleware = tower::ServiceBuilder::new()
         // Add metrics handler first (before other layers) so it can intercept /metrics
@@ -288,6 +358,25 @@ mod tests {
         let env_var_name = "TEST_ENV_VAR_MISSING_UNIQUE_ABC789";
 
         let result = get_value_by_priority(env_var_name, None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_value_by_priority_empty_env_var_falls_back_to_config() {
+        let env_var_name = "TEST_ENV_VAR_EMPTY_ENV_UNIQUE_DEF456";
+        env::set_var(env_var_name, "");
+
+        let result = get_value_by_priority(env_var_name, Some("config_value".to_string()));
+        assert_eq!(result, Some("config_value".to_string()));
+
+        env::remove_var(env_var_name);
+    }
+
+    #[test]
+    fn test_get_value_by_priority_empty_config_value_is_ignored() {
+        let env_var_name = "TEST_ENV_VAR_EMPTY_CONFIG_UNIQUE_GHI789";
+
+        let result = get_value_by_priority(env_var_name, Some("".to_string()));
         assert_eq!(result, None);
     }
 

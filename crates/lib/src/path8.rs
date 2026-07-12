@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use solana_message::{compiled_instruction::CompiledInstruction, VersionedMessage};
@@ -337,7 +337,7 @@ mod tests {
             &[1, 2, 3],
             vec![AccountMeta::new_readonly(account, false)],
         );
-        let msg1 = VersionedMessage::Legacy(Message::new(&[ix.clone()], Some(&payer)));
+        let msg1 = VersionedMessage::Legacy(Message::new(std::slice::from_ref(&ix), Some(&payer)));
         let msg2 = VersionedMessage::Legacy(Message::new(&[ix], Some(&payer)));
         let tx1 = crate::transaction::TransactionUtil::new_unsigned_versioned_transaction(msg1);
         let tx2 = crate::transaction::TransactionUtil::new_unsigned_versioned_transaction(msg2);
